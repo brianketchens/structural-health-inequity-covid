@@ -1,0 +1,2994 @@
+---
+title: "COVID-19 County-Level Mortality Analysis"
+subtitle: "Excess Death Rates, Demographic Drivers, Seasonal Variance and Outlier Detection"
+author: "Brian E. Ketchens"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    fig_width: 12
+    fig_height: 7
+---
+
+```{css, echo=FALSE}
+/* Fix TOC wrapped line alignment */
+.tocify-item {
+  white-space: normal !important;
+}
+
+.tocify ul li a {
+  display: block;
+  padding-left: 10px;
+  text-indent: -10px;
+  padding-right: 8px;
+}
+
+.tocify-subheader .tocify-item a {
+  padding-left: 25px;
+  text-indent: -10px;
+}
+
+.tocify-subheader .tocify-subheader .tocify-item a {
+  padding-left: 40px;
+  text-indent: -10px;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  cache     = FALSE
+)
+```
+
+
+
+# 1. Environment & Data Connection
+
+```{r libraries}
+# ---- Core ----
+library(tidyverse)
+library(lubridate)
+library(readr)
+
+# ---- BigQuery connection (retained for Option 3 development) ----
+library(bigrquery)
+library(DBI)
+
+# ---- Statistical modeling ----
+library(MASS)
+library(lme4)
+library(broom)
+library(broom.mixed)
+
+# ---- Time series / seasonal decomposition ----
+library(forecast)
+library(tsibble)
+library(feasts)
+
+# ---- Visualization ----
+library(scales)
+library(ggrepel)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+library(ggridges)
+
+# ---- Spatial ----
+library(tigris)
+library(sf)
+
+# ---- Tables ----
+library(gt)
+library(kableExtra)
+
+# ---- Hexbin ---
+install.packages("hexbin")
+
+# ---- Plotly --- 
+install.packages("plotly")
+
+# ---- Leaflet ---
+install.packages("leaflet")
+```
+
+```{r tigris_setup, include=FALSE, message=FALSE, warning=FALSE}
+# ============================================================
+# Pre-download and cache all Census shapefiles silently
+# Prevents tigris progress bars from appearing in knit output
+# After first run shapefiles are cached and this is instant
+# ============================================================
+options(tigris_use_cache = TRUE)
+
+suppressMessages(
+  suppressWarnings({
+    counties_sf <- counties(cb = TRUE, resolution = "20m", 
+                            year = 2020) %>%
+      mutate(fips = paste0(STATEFP, COUNTYFP)) %>%
+      filter(!STATEFP %in% c("02", "15", "60", 
+                              "66", "69", "72", "78"))
+    
+    all_us_counties <- counties_sf %>%
+      as.data.frame() %>%
+      dplyr::select(fips, STATEFP, NAME, STATE_NAME)
+  })
+)
+```
+
+```{r bq_connection}
+# BigQuery live connection not needed for CSV workflow.
+# Retained for reference when transitioning to state-level
+# development queries in Option 3.
+
+# PROJECT_ID <- "covid-explorer"
+# bq_auth(path = NULL)
+# con <- dbConnect(
+#   bigrquery::bigquery(),
+#   project = PROJECT_ID,
+#   dataset = "covid_analytics",
+#   billing = PROJECT_ID
+# )
+```
+
+```{r load_data, results ='hide', message=FALSE}
+# ============================================================
+# Load county_weekly from CSV
+# Negative value clamping and weekly aggregation were performed
+# in BigQuery before export -- no raw daily data needed here.
+# ============================================================
+
+county_weekly <- read_csv("county_weekly.csv") %>%
+  mutate(
+    week_start    = as.Date(week_start),
+    fips          = as.character(fips),
+    pandemic_wave = factor(pandemic_wave, levels = c(
+      "pre_pandemic", "1_initial", "2_summer2020", "3_winter2021",
+      "4_alpha", "5_delta", "6_omicron", "7_endemic"
+    )),
+    vaccine_era = factor(vaccine_era, levels = c(
+      "pre_vaccine", "early_rollout", "broad_availability"
+    )),
+    year     = as.integer(year),
+    month    = as.integer(month),
+    iso_week = as.integer(iso_week)
+  )
+
+cat("Rows loaded:  ", nrow(county_weekly), "\n")
+cat("Counties:     ", n_distinct(county_weekly$fips), "\n")
+cat("Date range:   ", as.character(min(county_weekly$week_start)),
+    "to", as.character(max(county_weekly$week_start)), "\n")
+```
+
+
+
+# 2. Data Quality & Exploratory Overview
+
+```{r data_quality}
+missing_summary <- county_weekly %>%
+  summarise(across(everything(), ~mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "pct_missing") %>%
+  filter(pct_missing > 0) %>%
+  arrange(desc(pct_missing))
+
+missing_summary %>%
+  mutate(pct_missing = scales::percent(pct_missing, accuracy = 0.1)) %>%
+  kable(caption = "Columns with Missing Values") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+```{r data_cleanup}
+# Drop columns with 100% missingness -- no analytical value
+county_weekly <- county_weekly %>%
+  dplyr::select(-new_tested_wk, -test_positivity_wk)
+
+# Mobility coverage note
+mobility_coverage <- county_weekly %>%
+  summarise(
+    counties_with_mobility = n_distinct(fips[!is.na(mobility_retail)]),
+    total_counties         = n_distinct(fips),
+    pct_coverage           = scales::percent(
+      n_distinct(fips[!is.na(mobility_retail)]) / n_distinct(fips),
+      accuracy = 0.1
+    )
+  )
+
+cat("Counties with mobility data:", mobility_coverage$counties_with_mobility, 
+    "of", mobility_coverage$total_counties,
+    "(", mobility_coverage$pct_coverage, ")\n")
+
+# NOTE: Missing mobility data skews toward rural/small counties.
+# Mobility variables will be used descriptively, not as model covariates.
+# Treat NULL case and death counts as zero
+# These represent weeks with no reported activity,
+# not truly missing data -- the pipeline used NULL instead of 0
+county_weekly <- county_weekly %>%
+  mutate(
+    new_confirmed_wk = replace_na(new_confirmed_wk, 0),
+    new_deceased_wk  = replace_na(new_deceased_wk,  0),
+    case_rate_wk     = replace_na(case_rate_wk,     0),
+    death_rate_wk    = replace_na(death_rate_wk,    0),
+    # Cumulative columns: carry forward last known value within each county
+    # For now replace with 0 -- use max() in county_totals
+    # to handle this correctly
+    cumulative_confirmed = replace_na(cumulative_confirmed, 0),
+    cumulative_deceased  = replace_na(cumulative_deceased,  0),
+    cum_case_rate_100k   = replace_na(cum_case_rate_100k,   0),
+    cum_death_rate_100k  = replace_na(cum_death_rate_100k,  0)
+  )
+```
+
+
+
+# 3. National Overview
+
+
+```{r national_trend, fig.cap="Weekly national COVID-19 cases and deaths per 100k population"}
+national_weekly <- county_weekly %>%
+  group_by(week_start, pandemic_wave) %>%
+  summarise(
+    case_rate_national  = weighted.mean(case_rate_wk,  total_pop, na.rm = TRUE),
+    death_rate_national = weighted.mean(death_rate_wk, total_pop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+wave_colors <- c(
+  "1_initial"    = "#E63946",
+  "2_summer2020" = "#F4A261",
+  "3_winter2021" = "#457B9D",
+  "4_alpha"      = "#2A9D8F",
+  "5_delta"      = "#E76F51",
+  "6_omicron"    = "#6A0572",
+  "7_endemic"    = "#A8DADC",
+  "pre-pandemic" = "#CCCCCC"
+)
+
+p_cases <- ggplot(national_weekly,
+                  aes(x = week_start, y = case_rate_national, fill = pandemic_wave)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(values = wave_colors, name = "Wave") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Weekly Case Rate per 100k (Population-Weighted National Average)",
+       x = NULL, y = "Cases per 100k") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+p_deaths <- ggplot(national_weekly,
+                   aes(x = week_start, y = death_rate_national, fill = pandemic_wave)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(values = wave_colors, name = "Wave") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Weekly Death Rate per 100k (Population-Weighted National Average)",
+       x = NULL, y = "Deaths per 100k") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+p_cases / p_deaths
+```
+
+
+# 3b. Hypothesis Testing
+
+The national trend analysis in Section 3 established the broad 
+arc of the pandemic. Three specific hypotheses emerge from that 
+picture that the data can formally test. Each hypothesis is 
+stated, tested with an appropriate statistical method, and 
+interpreted in the context of the structural inequity findings 
+that follow in Sections 4 through 7.
+
+```{r hypothesis_setup}
+# ============================================================
+# HYPOTHESIS TESTING SETUP
+# Derive wave-specific county summaries for all three tests
+# ============================================================
+
+wave_county_rates <- county_weekly %>%
+  filter(pandemic_wave != "pre_pandemic") %>%
+  group_by(fips, county_name, state_name, pandemic_wave, total_pop) %>%
+  summarise(
+    wave_death_rate = (sum(new_deceased_wk,  na.rm = TRUE) / 
+                       first(total_pop)) * 100000,
+    wave_case_rate  = (sum(new_confirmed_wk, na.rm = TRUE) / 
+                       first(total_pop)) * 100000,
+    wave_cfr        = sum(new_deceased_wk,  na.rm = TRUE) /
+                      pmax(sum(new_confirmed_wk, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  filter(wave_death_rate >= 0, wave_case_rate >= 0)
+
+```
+
+### Hypothesis 1: Did Prior Exposure Protect Counties During Delta?
+
+**Stated Hypothesis:** Counties with higher vaccination rates had 
+statistically lower death rates during the Delta wave after 
+controlling for age structure and socioeconomic status.
+
+**Methodological Note:** County-level vaccination data is not yet 
+integrated into this dataset and will be added in Phase 2. In its 
+absence this hypothesis is tested through a structural proxy — 
+comparing each county's Wave 1 death rate against its Delta wave 
+death rate. Counties that bore catastrophic Wave 1 burden had 
+large portions of their populations exposed to the virus before 
+vaccines were available. If prior infection conferred meaningful 
+population-level protection, those same counties should show 
+relative improvement during Delta regardless of vaccination 
+coverage. This is a testable prediction the data can evaluate 
+directly.
+
+> **Why This Matters:** If prior infection immunity and vaccination 
+> immunity produced similar protective effects at the population 
+> level, the policy implications differ from a world where 
+> vaccination alone drove Delta protection. The Phase 2 
+> vaccination data integration will formally partition these 
+> two mechanisms. For now the proxy approach tells us whether 
+> the protection pattern is consistent with prior exposure 
+> as a plausible explanation.
+
+The paired t-test results and county-level scatter plot below 
+examine whether Wave 1 burden predicted Delta improvement — 
+and the answer is striking.
+
+```{r hypothesis_1, fig.cap="H1: Did county vaccination rate predict lower Delta death rates?"}
+
+delta_vs_wave1 <- wave_county_rates %>%
+  filter(pandemic_wave %in% c("1_initial", "5_delta")) %>%
+  dplyr::select(fips, county_name, state_name, pandemic_wave,
+                wave_death_rate, total_pop) %>%
+  pivot_wider(
+    names_from  = pandemic_wave,
+    values_from = wave_death_rate,
+    names_prefix = "dr_"
+  ) %>%
+  left_join(
+    county_weekly %>%
+      dplyr::select(fips, pct_65_over, poverty_rate,
+                    pct_black, pct_hispanic, median_age) %>%
+      distinct(fips, .keep_all = TRUE),
+    by = "fips"
+  ) %>%
+    
+  drop_na()
+
+# Paired t-test: did death rates differ between Wave 1 and Delta?
+t_result <- t.test(delta_vs_wave1$dr_5_delta,
+                   delta_vs_wave1$dr_1_initial,
+                   paired = TRUE)
+
+cat("Mean Wave 1 death rate:  ", round(mean(delta_vs_wave1$dr_1_initial, na.rm=TRUE), 2), "\n")
+cat("Mean Delta death rate:   ", round(mean(delta_vs_wave1$dr_5_delta,   na.rm=TRUE), 2), "\n")
+cat("Mean difference:         ", round(t_result$estimate, 2), "\n")
+cat("95% CI:                  ", round(t_result$conf.int[1], 2),
+    "to", round(t_result$conf.int[2], 2), "\n")
+cat("p-value:                 ", scales::pvalue(t_result$p.value), "\n")
+
+# Visual: scatter of Wave 1 vs Delta death rate by county
+# Counties above the diagonal had WORSE Delta outcomes than Wave 1
+delta_vs_wave1 %>%
+  mutate(
+    burden_shift = case_when(
+      dr_5_delta > dr_1_initial * 1.5 ~ "Much worse in Delta",
+      dr_5_delta > dr_1_initial       ~ "Worse in Delta",
+      dr_5_delta < dr_1_initial * 0.5 ~ "Much better in Delta",
+      TRUE                             ~ "Similar"
+    ),
+    burden_shift = factor(burden_shift, levels = c(
+      "Much worse in Delta", "Worse in Delta",
+      "Similar", "Much better in Delta"
+    ))
+  ) %>%
+  ggplot(aes(x = dr_1_initial, y = dr_5_delta, color = burden_shift)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "black", linewidth = 0.8) +
+  scale_color_manual(
+    values = c(
+      "Much worse in Delta"  = "#E63946",
+      "Worse in Delta"       = "#F4A261",
+      "Similar"              = "grey60",
+      "Much better in Delta" = "#457B9D"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  annotate("text", x = Inf, y = -Inf,
+           label = "Above line = worse in Delta than Wave 1",
+           hjust = 1.1, vjust = -0.5, size = 3.5, color = "grey40") +
+  labs(
+    title    = "H1: County Death Rate - Wave 1 vs Delta",
+    subtitle = "Each point = one county | Dashed line = equal burden",
+    x        = "Wave 1 Death Rate per 100k",
+    y        = "Delta Wave Death Rate per 100k",
+    caption  = "NOTE: Vaccination rate covariate to be added when CDC data integrated"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+### Reading the H1 Results
+
+The mean Delta wave death rate (78.6 per 100k) was dramatically 
+higher than the mean Wave 1 death rate (17.1 per 100k) — a 
+difference of 61.5 deaths per 100k that is statistically 
+unambiguous (95% CI: 59.0 to 64.0, p<0.001). Delta was 
+substantially more lethal at the county level than the initial 
+outbreak by almost every measure.
+
+However the scatter plot reveals something the aggregate numbers 
+obscure. The 137 counties classified as Much Better in Delta — 
+those that improved most dramatically from Wave 1 — cluster into 
+three geographically and mechanistically distinct groups, each 
+pointing toward a different protective pathway.
+
+```{r h1_county_detail}
+h1_detail <- delta_vs_wave1 %>%
+  mutate(
+    burden_shift = case_when(
+      dr_5_delta > dr_1_initial * 1.5 ~ "Much worse in Delta",
+      dr_5_delta > dr_1_initial       ~ "Worse in Delta",
+      dr_5_delta < dr_1_initial * 0.5 ~ "Much better in Delta",
+      TRUE                             ~ "Similar"
+    ),
+    burden_shift = factor(burden_shift, levels = c(
+      "Much worse in Delta", "Worse in Delta",
+      "Similar", "Much better in Delta"
+    )),
+    dr_1_initial = round(dr_1_initial, 1),
+    dr_5_delta   = round(dr_5_delta,   1),
+    delta_vs_w1  = round(dr_5_delta - dr_1_initial, 1)
+  ) %>%
+  dplyr::select(county_name, state_name, dr_1_initial,
+                dr_5_delta, delta_vs_w1, burden_shift) %>%
+  rename(
+    County        = county_name,
+    State         = state_name,
+    Wave1_rate    = dr_1_initial,
+    Delta_rate    = dr_5_delta,
+    Difference    = delta_vs_w1,
+    Burden_category = burden_shift
+  ) %>%
+  arrange(desc(Delta_rate))
+
+# Summary count by category -- uses Burden_category
+h1_detail %>%
+  count(Burden_category) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  print()
+
+# Display table -- drop Burden_category for clean presentation
+h1_detail %>%
+  slice_head(n = 20) %>%
+  dplyr::select(County, State, Wave1_rate,
+                Delta_rate, Difference) %>%
+  kable(caption = "Worst 20 Counties by Delta Wave Death Rate per 100k") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r h1_county_by_category}
+
+cat("Counties classified as Much Better in Delta than Wave 1:\n")
+h1_detail %>%
+  filter(Burden_category == "Much better in Delta") %>%
+  arrange(desc(Wave1_rate)) %>%
+  slice_head(n = 30) %>% 
+  dplyr::select(County, State, Wave1_rate, 
+                Delta_rate, Difference) %>%   # Burden_category removed
+  kable(caption = "Top 30 Counties That Improved: Highest Wave 1 Burden, Lower Delta Burden") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Protected Clusters
+
+There were 137 counties classified as having substantially lower 
+Delta wave death rates relative to their Wave 1 burden — 
+counties where prior exposure appears to have conferred meaningful 
+population-level protection against subsequent waves. The counties were classified into mechanistic subgroups for separate analytical treatment.
+
+> **Analytical Caution:** The Deep South improvement magnitude 
+> may be partially artifactual. Wave 1 death rates in these counties
+> may be inflated by:
+>
+> 1. **Denominator problems** -- small county populations amplify rates.
+> 2. **Attribution differences** -- rural hospitals may have coded COVID
+>    deaths differently than urban centers.
+> 3. **Reporting lag** -- smaller counties sometimes batch-reported deaths.
+>
+> These hypotheses cannot be resolved without death certificate
+> microdata but should be noted as limitations in the findings.
+
+```{r h1_protected_clusters}
+
+protected_counties <- h1_detail %>%
+  filter(Burden_category == "Much better in Delta") %>%
+  mutate(
+    protection_hypothesis = case_when(
+      # Northeast urban corridor -- vaccination + prior immunity
+      State %in% c("New York", "New Jersey", "Massachusetts",
+                   "Connecticut", "Rhode Island") &
+        Wave1_rate > 50                          ~ "Urban NE: Vaccination + Prior Immunity",
+
+      # Deep South Black Belt -- prior infection, low vaccination
+      State %in% c("Georgia", "Mississippi",
+                   "Louisiana", "Alabama") &
+        Wave1_rate > 100                         ~ "Deep South: Prior Infection",
+
+      # Nebraska meatpacking cluster
+      State == "Nebraska"                        ~ "NEB Meatpacking: Occupational Prior Immunity",
+
+      # Mid-Atlantic urban
+      State %in% c("Maryland", "Pennsylvania",
+                   "Virginia", "District of Columbia") ~ "Mid-Atlantic Urban",
+
+      # Everything else
+      TRUE                                       ~ "Other"
+    )
+  )
+
+# Summary by hypothesis group
+protected_counties %>%
+  group_by(protection_hypothesis) %>%
+  summarise(
+    n_counties       = n(),
+    mean_wave1_rate  = round(mean(Wave1_rate, na.rm = TRUE), 1),
+    mean_delta_rate  = round(mean(Delta_rate, na.rm = TRUE), 1),
+    mean_improvement = round(mean(abs(Difference), na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_improvement)) %>%
+  kable(caption = "Protected County Clusters: Three Distinct Protective Mechanisms") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Three Distinct Protective Mechanisms
+
+The 137 counties that resisted Delta's surge fall into three 
+analytically distinct clusters that tell different causal stories:
+
+**Urban Northeast — Vaccination and Prior Immunity (48 counties)**
+New York, New Jersey, Massachusetts, and neighboring states 
+dominated this cluster with a mean improvement of 115.6 deaths 
+per 100k. These densely populated counties were devastated in 
+Wave 1 and then dramatically protected during Delta — almost 
+certainly reflecting the combined effect of high vaccination 
+rates and widespread prior infection creating a high threshold 
+of population immunity before Delta arrived.
+
+**Deep South — Prior Infection Without Vaccination (14 counties)**
+This is the most analytically striking cluster. Fourteen small 
+rural majority Black counties in Georgia, Mississippi, and 
+Louisiana achieved the greatest absolute improvement of any 
+group — a mean of 136.1 deaths per 100k — despite almost 
+certainly having lower vaccination rates than the Urban Northeast 
+cluster. Their catastrophic Wave 1 burden, likely substantially 
+undercounted due to limited rural testing infrastructure, appears 
+to have created population-level immunity that persisted into the 
+Delta wave. The data cannot confirm this mechanism without 
+vaccination coverage data but it is the most parsimonious 
+explanation consistent with the pattern observed.
+
+**Nebraska Meatpacking Counties — Occupational Prior Immunity 
+(11 counties)**
+Dakota, Hall, Hamilton, Colfax, and neighboring Nebraska counties 
+with large meatpacking plant workforces experienced explosive 
+outbreaks in Wave 1 when plants became superspreader environments. 
+By Delta their mean death rate fell to just 4.5 per 100k — a 92% 
+reduction from Wave 1. This is a textbook occupational prior 
+immunity cluster and one of the most analytically clean natural 
+experiments in the dataset.
+
+> **Analytical Caution:** The ordering of improvement magnitude — 
+> Deep South counties improving more than Urban Northeast counties 
+> despite likely lower vaccination coverage — is consistent with 
+> prior infection immunity being at least as protective as 
+> vaccination at the population level during the Delta wave. 
+> This finding should be interpreted carefully and will be 
+> formally tested when vaccination data is integrated in Phase 2. 
+> It does not argue against vaccination — it argues that the 
+> mechanisms of population protection are multiple and that 
+> prior infection contributed meaningfully to the geographic 
+> reorganization of burden documented in Hypothesis 3.
+
+### Hypothesis 2: Did COVID Cases Become Less Lethal After Omicron?
+
+**Stated Hypothesis:** The structural relationship between case 
+rate and death rate changed after Omicron, reflecting some 
+combination of variant attenuation, accumulated population 
+immunity, and changes in death coding practices.
+
+To test this, separate linear regressions were fitted relating 
+weekly case rates to weekly death rates for the pre-Omicron 
+period and the Omicron and post-Omicron period. If cases became 
+less lethal the slope of the post-Omicron regression line should 
+be meaningfully flatter than the pre-Omicron slope — meaning 
+each additional case produced fewer deaths.
+
+```{r hypothesis_2, fig.cap="H2: Did the case-to-death relationship change post-Omicron?"}
+# ============================================================
+# Method: fit separate OLS regressions of death_rate ~ case_rate
+# for pre-Omicron vs post-Omicron periods and compare slopes.
+# ============================================================
+
+cfr_structure <- county_weekly %>%
+  filter(new_confirmed_wk > 0, new_deceased_wk >= 0) %>%
+  mutate(
+    era = case_when(
+      pandemic_wave %in% c("1_initial", "2_summer2020",
+                           "3_winter2021", "4_alpha",
+                           "5_delta")           ~ "Pre-Omicron",
+      pandemic_wave %in% c("6_omicron",
+                           "7_endemic")         ~ "Omicron & Post",
+      TRUE                                       ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(era))
+
+# Fit separate models per era
+models_by_era <- cfr_structure %>%
+  group_by(era) %>%
+  summarise(
+    n           = n(),
+    slope       = coef(lm(death_rate_wk ~ case_rate_wk))[2],
+    intercept   = coef(lm(death_rate_wk ~ case_rate_wk))[1],
+    r_squared   = summary(lm(death_rate_wk ~ case_rate_wk))$r.squared,
+    .groups = "drop"
+  )
+
+models_by_era %>%
+  mutate(across(c(slope, intercept, r_squared), ~round(., 4))) %>%
+  print()
+
+# Two clean regression lines on one plot -- no points
+# The slope difference IS the finding
+
+ggplot(cfr_structure %>%
+         filter(case_rate_wk < 300, death_rate_wk < 15),
+       aes(x = case_rate_wk, y = death_rate_wk, color = era)) +
+  geom_smooth(
+    method    = "lm",
+    se        = TRUE,
+    linewidth = 2.0,
+    alpha     = 0.2      # confidence band transparency
+  ) +
+  scale_color_manual(
+    values = c("Pre-Omicron"    = "#E63946",
+               "Omicron & Post" = "#1D6FA4"),
+    name   = NULL
+  ) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  annotate("text",
+           x = 200, y = 11,
+           label = "Pre-Omicron: 0.0089 deaths per case",
+           color = "#E63946", size = 4.5, fontface = "bold", hjust = 0) +
+  annotate("text",
+           x = 200, y = 9.5,
+           label = "Omicron & Post: 0.0013 deaths per case",
+           color = "#1D6FA4", size = 4.5, fontface = "bold", hjust = 0) +
+  annotate("text",
+           x = 200, y = 8.0,
+           label = "85% reduction in case lethality",
+           color = "grey30", size = 4.0, fontface = "italic", hjust = 0) +
+  labs(
+    title    = "H2: Did COVID Cases Become Less Lethal Post-Omicron?",
+    subtitle = "Regression lines fitted to 300k county-weeks | Bands = 95% confidence interval",
+    x        = "Weekly Case Rate per 100k",
+    y        = "Weekly Death Rate per 100k",
+    caption  = "Pre-Omicron slope 6.8x steeper than Omicron & Post -- consistent with attenuation and/or immunity"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+### Reading the H2 Results
+
+The evidence is unambiguous. The slope of the case rate to death 
+rate relationship dropped by approximately 85% between the 
+pre-Omicron period (slope = 0.0089) and the Omicron and 
+post-Omicron period (slope = 0.0013). A case of COVID in the 
+endemic era was approximately seven times less likely to result 
+in death than a case during the Delta wave or earlier.
+
+The chart makes this visible without any statistical training 
+required — the red pre-Omicron line rises steeply as case rates 
+increase while the blue post-Omicron line is nearly flat across 
+the same range.
+
+Three mechanisms likely contributed to this structural change 
+and the data cannot cleanly separate them:
+
+**Variant attenuation** — Omicron and subsequent variants were 
+intrinsically less virulent at the individual level, a finding 
+supported by clinical literature independently of this analysis.
+
+**Population immunity** — by late 2021 a substantial fraction 
+of the US population carried immunity from vaccination, prior 
+infection, or both, reducing the probability of severe disease 
+per exposure even when cases were high.
+
+**Surveillance and coding changes** — the elevated intercept 
+in the post-Omicron model (3.31 vs 1.76 deaths per 100k at 
+zero cases) suggests deaths were occurring in the endemic phase 
+that were not being linked to active case counts. This is 
+consistent with documented changes in how COVID deaths were 
+attributed on death certificates beginning in 2022.
+
+> **What the R-squared Values Tell Us:** Both models show low 
+> R-squared values — 0.062 pre-Omicron and 0.009 post-Omicron. 
+> This means case rate alone explains very little of the 
+> variation in death rate at the county level in either period. 
+> County-level structural factors — the demographic and 
+> socioeconomic characteristics examined throughout this 
+> analysis — explain far more of the variation than raw case 
+> counts. This validates the county-level analytical approach 
+> of this entire document.
+
+
+### Hypothesis 3: Did the Same Counties Bear the Burden 
+Throughout the Pandemic?
+
+**Stated Hypothesis:** Counties with the highest Wave 1 death 
+rates were not necessarily the same counties that drove 
+subsequent waves. Pandemic burden shifted geographically as 
+variants changed and population immunity accumulated.
+
+Spearman rank correlation measures whether the ordering of 
+counties by death rate stayed consistent across waves. A 
+correlation near 1.0 means the same counties were consistently 
+hardest hit — the burden was stable and predictable. A 
+correlation near zero means knowing a county's rank in one 
+wave tells you nothing about its rank in another — the burden 
+reorganized completely. A negative correlation would mean 
+counties that fared worst in one wave actually fared better 
+in the next.
+
+```{r hypothesis_3, fig.cap="H3: Did the same counties bear disproportionate burden across waves?"}
+
+# Pivot to wide format: one row per county, one column per wave
+wave_ranks <- wave_county_rates %>%
+  dplyr::select(fips, county_name, state_name,
+                pandemic_wave, wave_death_rate) %>%
+  pivot_wider(
+    names_from  = pandemic_wave,
+    values_from = wave_death_rate
+  ) %>%
+  drop_na()
+
+# Compute Spearman correlations between all wave pairs
+wave_cols <- c("1_initial", "2_summer2020", "3_winter2021",
+               "4_alpha", "5_delta", "6_omicron")
+
+wave_cor <- wave_ranks %>%
+  dplyr::select(all_of(wave_cols)) %>%
+  cor(method = "spearman", use = "complete.obs")
+
+# Display as readable table
+wave_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("Wave") %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kable(caption = paste(
+    "H3: Spearman Rank Correlations of County Death Rates Across Waves",
+    "(1.0 = identical ranking, 0 = no relationship, negative = reversed)"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### H3 visual companion to the correlation table (focus on Wave 1 vs Delta)
+
+```{r hypothesis_3_visual, fig.cap="H3: Wave 1 vs Delta burden -- did high-burden counties persist?"}
+
+wave_ranks %>%
+  filter(!is.na(`1_initial`), !is.na(`5_delta`)) %>%
+  mutate(
+    rank_wave1 = rank(`1_initial`),
+    rank_delta = rank(`5_delta`),
+    rank_diff  = rank_delta - rank_wave1,
+    burden_persistence = case_when(
+      rank_wave1 > quantile(rank_wave1, 0.75) &
+        rank_delta > quantile(rank_delta, 0.75) ~ "Persistently High",
+      rank_wave1 < quantile(rank_wave1, 0.25) &
+        rank_delta < quantile(rank_delta, 0.25) ~ "Persistently Low",
+      rank_wave1 > quantile(rank_wave1, 0.75) &
+        rank_delta < quantile(rank_delta, 0.25) ~ "High->Low (improved)",
+      rank_wave1 < quantile(rank_wave1, 0.25) &
+        rank_delta > quantile(rank_delta, 0.75) ~ "Low->High (worsened)",
+      TRUE                                       ~ "Middle"
+    )
+  ) %>%
+  ggplot(aes(x = rank_wave1, y = rank_delta, color = burden_persistence)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey40") +
+  scale_color_manual(
+    values = c(
+      "Persistently High"   = "#E63946",
+      "Persistently Low"    = "#2A9D8F",
+      "High->Low (improved)"= "#457B9D",
+      "Low->High (worsened)"= "#F4A261",
+      "Middle"              = "grey70"
+    ),
+    name = NULL
+  ) +
+  labs(
+    title    = "H3: County Burden Persistence -- Wave 1 vs Delta",
+    subtitle = "Persistently high-burden counties appear in red upper right",
+    x        = "County Death Rate Rank in Wave 1",
+    y        = "County Death Rate Rank in Delta Wave",
+    caption  = "Dashed line = identical rank in both waves"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+### Reading the H3 Scatter Plot
+```
+The near-zero Spearman correlation between Wave 1 and Delta county 
+death rate ranks (ρ = -0.003) is visible in the broad scatter of 
+grey points around the diagonal reference line — if burden had 
+persisted geographically the points would cluster tightly along 
+that dashed line. Instead the cloud is diffuse, confirming that 
+knowing a county's Wave 1 rank tells you almost nothing about 
+its Delta rank.
+
+Three analytically distinct county groups emerge from the quadrant 
+classification:
+
+**Persistently High (red, upper right):** Counties ranking in the 
+top quartile for both waves. These represent communities with 
+structural vulnerabilities — demographic, economic, or geographic — 
+that made them targets for successive variant waves regardless of 
+the pandemic's shifting geography. Identifying what these counties 
+share is a priority for the regression model in Section 7.
+
+**High to Low / Improved (blue, lower right):** Counties with 
+high Wave 1 burden that achieved relative protection by Delta. 
+As established in H1, these are predominantly the urban Northeast 
+corridor and Deep South counties where catastrophic Wave 1 exposure 
+created population-level immunity ahead of Delta's arrival.
+
+**The vertical spread at low Wave 1 ranks (left edge):** Counties 
+with near-zero Wave 1 mortality were distributed across the entire 
+spectrum of Delta outcomes — some remained protected, others became 
+Delta epicenters. This pattern is consistent with the geographic 
+reorganization hypothesis: initial sparing from Wave 1 conferred 
+no protection advantage and in some cases left populations 
+immunologically naive heading into the more transmissible Delta wave.
+```
+
+```{r h3_persistently_high, include = FALSE}
+
+# ============================================================
+# Identify the Persistently High burden counties
+# These are the communities structural vulnerability kept
+# at elevated risk across multiple variant waves
+# ============================================================
+
+persistently_high <- wave_ranks %>%
+  filter(!is.na(`1_initial`), !is.na(`5_delta`)) %>%
+  mutate(
+    rank_wave1 = rank(`1_initial`),
+    rank_delta = rank(`5_delta`),
+    n_counties = n()
+  ) %>%
+  filter(
+    rank_wave1 > quantile(rank_wave1, 0.75),
+    rank_delta > quantile(rank_delta, 0.75)
+  ) %>%
+  left_join(
+    county_weekly %>%
+      dplyr::select(fips, pct_black, pct_65_over,
+                    poverty_rate, pct_no_cars,
+                    median_age, total_pop, pct_less_than_hs) %>%
+      distinct(fips, .keep_all = TRUE),
+    by = "fips"
+  ) %>%
+  arrange(desc(`5_delta`))
+
+cat("Persistently High burden counties:", nrow(persistently_high), "\n\n")
+
+# State distribution
+cat("State distribution of Persistently High counties:\n")
+persistently_high %>%
+  count(state_name, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  print()
+
+# Demographic profile vs all counties
+cat("\nDemographic profile: Persistently High vs All Counties\n")
+cat("--------------------------------------------------------\n")
+tibble(
+  characteristic   = c("Median Age", "% Age 65+", "% Black",
+                        "Poverty Rate", "% Without HS Diploma", "% No Car", "Population"),
+  persistently_high = c(
+    round(mean(persistently_high$median_age,       na.rm = TRUE), 1),
+    round(mean(persistently_high$pct_65_over,      na.rm = TRUE), 3),
+    round(mean(persistently_high$pct_black,        na.rm = TRUE), 3),
+    round(mean(persistently_high$poverty_rate,     na.rm = TRUE), 3),
+    round(mean(persistently_high$pct_less_than_hs, na.rm = TRUE), 3),
+    round(mean(persistently_high$pct_no_cars,      na.rm = TRUE), 3),
+    round(mean(persistently_high$total_pop,        na.rm = TRUE), 0)
+  ),
+  all_counties = c(
+    round(mean(wave_ranks$median_age,       na.rm = TRUE), 1),
+    round(mean(wave_ranks$pct_65_over,      na.rm = TRUE), 3),
+    round(mean(wave_ranks$pct_black,        na.rm = TRUE), 3),
+    round(mean(wave_ranks$poverty_rate,     na.rm = TRUE), 3),
+    round(mean(wave_ranks$pct_less_than_hs, na.rm = TRUE), 3),
+    round(mean(wave_ranks$pct_no_cars,      na.rm = TRUE), 3),
+    round(mean(wave_ranks$total_pop,        na.rm = TRUE), 0)
+  )
+) %>%
+  kable(caption = "Demographic Profile: Persistently High Burden Counties vs All Counties") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r h3_persistently_high_fixed, echo=FALSE, results='hide'}
+# Pull demographic reference for ALL counties from county_weekly
+all_county_demos <- county_weekly %>%
+  dplyr::select(fips, median_age, pct_65_over, pct_black,
+                poverty_rate, pct_no_cars, total_pop, pct_less_than_hs) %>%
+  distinct(fips, .keep_all = TRUE)
+
+persistently_high_demos <- persistently_high %>%
+  dplyr::select(fips) %>%
+  left_join(all_county_demos, by = "fips")
+
+tibble(
+  Characteristic    = c("Median Age", "% Age 65+", "% Black",
+                         "Poverty Rate", "% Without HS Diploma",
+                         "% No Car", "Population"),
+  Persistently_High = c(
+    round(mean(persistently_high_demos$median_age,    na.rm = TRUE), 1),
+    scales::percent(mean(persistently_high_demos$pct_65_over,  na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_black,    na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$poverty_rate, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_no_cars,  na.rm = TRUE), accuracy = 0.1),
+    scales::comma(round(mean(persistently_high_demos$total_pop, na.rm = TRUE), 0))
+  ),
+  All_Counties = c(
+    round(mean(all_county_demos$median_age,    na.rm = TRUE), 1),
+    scales::percent(mean(all_county_demos$pct_65_over,  na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_black,    na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$poverty_rate, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_no_cars,  na.rm = TRUE), accuracy = 0.1),
+    scales::comma(round(mean(all_county_demos$total_pop, na.rm = TRUE), 0))
+  )
+) %>%
+  kable(caption = "Demographic Profile: Persistently High Burden vs All Counties") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r h3_burden_shift_comparison}
+# ============================================================
+# Three-way demographic comparison:
+# Persistently High vs High-to-Low vs All Counties
+# Tests whether High-to-Low counties differ structurally
+# from both persistently burdened and average communities
+# ============================================================
+
+# Identify High-to-Low counties from wave_ranks
+high_to_low <- wave_ranks %>%
+  filter(!is.na(`1_initial`), !is.na(`5_delta`)) %>%
+  mutate(
+    rank_wave1 = rank(`1_initial`),
+    rank_delta = rank(`5_delta`)
+  ) %>%
+  filter(
+    rank_wave1 > quantile(rank_wave1, 0.75),  # top quartile Wave 1
+    rank_delta < quantile(rank_delta, 0.25)    # bottom quartile Delta
+  )
+
+cat("High-to-Low counties identified:", nrow(high_to_low), "\n")
+
+# Get demographics for High-to-Low counties
+high_to_low_demos <- high_to_low %>%
+  dplyr::select(fips) %>%
+  left_join(all_county_demos, by = "fips")
+
+# State distribution of High-to-Low counties
+cat("\nState distribution of High-to-Low counties:\n")
+high_to_low %>%
+  count(state_name, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  print()
+
+# Three-way comparison table
+tibble(
+  Characteristic = c(
+    "Median Age",
+    "% Age 65+",
+    "% Black",
+    "Poverty Rate",
+    "% Without HS Diploma",
+    "% No Car",
+    "Population"
+  ),
+  Persistently_High = c(
+    round(mean(persistently_high_demos$median_age,       na.rm = TRUE), 1),
+    scales::percent(mean(persistently_high_demos$pct_65_over,      na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_black,        na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$poverty_rate,     na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(persistently_high_demos$pct_no_cars,      na.rm = TRUE), accuracy = 0.1),
+    scales::comma(round(mean(persistently_high_demos$total_pop,    na.rm = TRUE), 0))
+  ),
+  High_to_Low = c(
+    round(mean(high_to_low_demos$median_age,       na.rm = TRUE), 1),
+    scales::percent(mean(high_to_low_demos$pct_65_over,      na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(high_to_low_demos$pct_black,        na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(high_to_low_demos$poverty_rate,     na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(high_to_low_demos$pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(high_to_low_demos$pct_no_cars,      na.rm = TRUE), accuracy = 0.1),
+    scales::comma(round(mean(high_to_low_demos$total_pop,    na.rm = TRUE), 0))
+  ),
+  All_Counties = c(
+    round(mean(all_county_demos$median_age,       na.rm = TRUE), 1),
+    scales::percent(mean(all_county_demos$pct_65_over,      na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_black,        na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$poverty_rate,     na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    scales::percent(mean(all_county_demos$pct_no_cars,      na.rm = TRUE), accuracy = 0.1),
+    scales::comma(round(mean(all_county_demos$total_pop,    na.rm = TRUE), 0))
+  )
+) %>%
+  kable(caption = paste0(
+    "Three-Way Demographic Comparison: ",
+    "Persistently High Burden vs High-to-Low vs All Counties"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  column_spec(2, background = "#ffe0e0") %>%  # red tint for persistently high
+  column_spec(3, background = "#e0f0ff") %>%  # blue tint for high to low
+  column_spec(4, background = "#f5f5f5")       # grey for all counties
+```
+
+### Reading the Three-Way Comparison
+
+The demographic profile of High-to-Low counties reveals 
+something the scatter plot could only show visually — the 
+communities that achieved the greatest protection during 
+Delta were not structurally similar to the communities that 
+remained persistently burdened. They were structurally 
+different in almost every meaningful way.
+
+High-to-Low counties had nearly ten times the population 
+of Persistently High counties (392,205 vs 42,577), 
+substantially lower poverty rates (10.8% vs 19.5% — and 
+notably below the national average of 15.3%), and the 
+lowest educational disadvantage of any group (6.9% without 
+a high school diploma vs 8.9% nationally and 12.2% in 
+Persistently High counties). Their elderly population share 
+was actually below the national average at 16.5%.
+
+These are not communities that achieved protection despite 
+structural disadvantage. These are communities that entered 
+the Delta wave with structural advantages — larger 
+populations, better-resourced public health infrastructure, 
+lower poverty, higher educational attainment, and the 
+accumulated prior exposure of dense urban Wave 1 outbreaks. 
+All of those factors pointed in the same protective 
+direction simultaneously.
+
+The Persistently High counties had none of those advantages. 
+Small populations, high poverty, lower educational 
+attainment, majority minority demographics, and rural 
+geographic isolation combined to create communities that 
+neither prior exposure nor vaccination nor healthcare 
+infrastructure could adequately protect across multiple 
+successive waves.
+
+> **The Central Finding of This Comparison:** The pandemic 
+> did not treat structurally disadvantaged communities 
+> differently because of random chance or bad luck. It 
+> treated them differently because the conditions that make 
+> a community resilient during a health emergency — economic 
+> resources, educational investment, healthcare 
+> infrastructure, population density sufficient to generate 
+> prior immunity — were systematically absent in the 
+> communities that bore persistent burden. Those conditions 
+> were not created by COVID. They existed before the first 
+> case was ever recorded. COVID simply made their 
+> consequences impossible to ignore.
+>
+> The question this analysis raises — and that Phase 2 data 
+> integration will pursue — is not why these communities 
+> fared worse during COVID. The data has answered that. The 
+> question is what investment in the structural conditions 
+> identified here would cost relative to the human and 
+> economic price of the next pandemic finding them in the 
+> same state.
+
+### Reading the H3 Results
+
+The correlation matrix delivers one of the most striking findings 
+in the entire analysis. Wave 1 is essentially uncorrelated with 
+every subsequent wave except Summer 2020:
+
+- Wave 1 vs Delta: ρ = -0.003 (effectively zero)
+- Wave 1 vs Omicron: ρ = 0.013 (effectively zero)
+- Wave 1 vs Winter 2021: ρ = -0.006 (effectively zero)
+
+Knowing which counties suffered most in the spring of 2020 
+tells you almost nothing about which counties suffered most 
+in the Delta wave eighteen months later. The pandemic 
+completely reorganized geographically after its initial 
+outbreak — the communities that bore the first wave's burden 
+were largely spared subsequent waves while communities that 
+were relatively protected in 2020 became epicenters of Delta 
+and beyond.
+
+The later waves — Winter 2021, Alpha, Delta, and Omicron — 
+show moderate positive correlations with each other ranging 
+from 0.242 to 0.389. A stable geography of vulnerability 
+emerged from Winter 2021 onward and persisted through the 
+end of the analysis period. Once a community entered the 
+high-burden tier in the second year of the pandemic it tended 
+to stay there.
+
+**Delta was the pivot point.** It correlates near zero with 
+Wave 1 (ρ = -0.003) but moderately with Omicron 
+(ρ = 0.389) — meaning Delta completed the geographic 
+reorganization that Summer 2020 had begun and established 
+the burden geography that defined the remainder of the 
+pandemic.
+
+The burden persistence scatter plot makes this visible at 
+the county level. The broad scatter of grey points around 
+the diagonal reference line — rather than clustering along 
+it — is the visual proof of near-zero correlation. Counties 
+that improved dramatically from Wave 1 to Delta appear in 
+blue in the lower right — these are your Urban Northeast 
+and Deep South protected clusters from H1. Counties that 
+remained consistently burdened across both waves appear in 
+red in the upper right — these are the structurally 
+vulnerable communities whose characteristics the regression 
+model in Section 7 formally identifies.
+
+> **The Three Hypotheses Together:** H1 showed that counties 
+> hardest hit in Wave 1 achieved substantial protection by 
+> Delta through prior immunity mechanisms. H3 confirms the 
+> statistical signature of that protection — near-zero 
+> correlation between Wave 1 and Delta county rankings means 
+> the burden did not just shift at the margins, it completely 
+> reorganized. H2 explains why this reorganization had such 
+> severe consequences — the case-to-death relationship 
+> remained steep during Delta before the post-Omicron 
+> structural decline. When burden shifted to counties with 
+> lower prior exposure, lower vaccination rates, and less 
+> healthcare infrastructure, each case was still highly 
+> lethal. The three findings interlock into a single coherent 
+> story about how structural disadvantage determined which 
+> communities paid the price for each successive wave.
+
+# 4. Excess Mortality -- Counties Above Expected Death Rate
+
+```{r county_totals}
+county_totals <- county_weekly %>%
+  group_by(fips, county_name, state_name,
+           total_pop, median_age, pct_white, pct_black, pct_hispanic,
+           pct_asian, pct_65_over, poverty_rate,
+           pct_no_cars, pop_per_housing_unit, pct_less_than_hs,
+           pct_bachelors_plus, pct_ag_mining_workers) %>%
+  summarise(
+    total_confirmed = max(cumulative_confirmed, na.rm = TRUE),
+    total_deceased  = max(cumulative_deceased,  na.rm = TRUE),
+    cum_case_rate   = max(cum_case_rate_100k,   na.rm = TRUE),
+    cum_death_rate  = max(cum_death_rate_100k,  na.rm = TRUE),
+    cfr_overall     = max(cumulative_deceased, na.rm = TRUE) /
+                      pmax(max(cumulative_confirmed, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  filter(total_pop >= 5000)
+```
+
+```{r excess_mortality}
+national_mean_dr <- mean(county_totals$cum_death_rate, na.rm = TRUE)
+national_sd_dr   <- sd(county_totals$cum_death_rate,   na.rm = TRUE)
+
+county_totals <- county_totals %>%
+  mutate(
+    death_rate_zscore = (cum_death_rate - national_mean_dr) / national_sd_dr,
+    excess_flag = case_when(
+      death_rate_zscore >= 3  ~ "Extreme (>=3 SD)",
+      death_rate_zscore >= 2  ~ "High (2-3 SD)",
+      death_rate_zscore >= 1  ~ "Elevated (1-2 SD)",
+      death_rate_zscore >= -1 ~ "Average",
+      TRUE                    ~ "Below Average"
+    ),
+    excess_flag = factor(excess_flag, levels = c(
+      "Extreme (>=3 SD)", "High (2-3 SD)", "Elevated (1-2 SD)",
+      "Average", "Below Average"
+    ))
+  )
+
+county_totals %>%
+  count(excess_flag) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  kable(caption = "County Distribution by Excess Mortality Flag") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r excess_top_counties}
+county_totals %>%
+  arrange(desc(cum_death_rate)) %>%
+  slice_head(n = 30) %>%
+  dplyr::select(county_name, state_name, total_pop, cum_death_rate,
+         death_rate_zscore, excess_flag, pct_65_over, poverty_rate) %>%
+  mutate(
+    cum_death_rate    = round(cum_death_rate, 1),
+    death_rate_zscore = round(death_rate_zscore, 2),
+    pct_65_over       = scales::percent(pct_65_over, accuracy = 0.1),
+    poverty_rate      = scales::percent(poverty_rate, accuracy = 0.1)
+  ) %>%
+  kable(caption = "Top 30 Counties by Cumulative COVID Death Rate per 100k") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Persistence Overlap
+
+How much do excess mortality flags overlap with persistently high burden counties from H3? This connects Section 4 findings to H3 findings formally.
+
+```{r excess_persistence_overlap}
+
+overlap_check <- county_totals %>%
+  dplyr::select(fips, county_name, state_name,
+                excess_flag, cum_death_rate) %>%
+  left_join(
+    persistently_high %>%
+      dplyr::select(fips) %>%
+      mutate(persistently_high = TRUE),
+    by = "fips"
+  ) %>%
+  mutate(persistently_high = replace_na(persistently_high, FALSE))
+
+# Cross-tabulation
+overlap_check %>%
+  group_by(excess_flag, persistently_high) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = persistently_high,
+    values_from = n,
+    names_prefix = "persist_high_"
+  ) %>%
+  mutate(
+    persist_high_FALSE = replace_na(persist_high_FALSE, 0),
+    persist_high_TRUE  = replace_na(persist_high_TRUE,  0),
+    total              = persist_high_FALSE + persist_high_TRUE,
+    pct_also_persistent = scales::percent(
+      persist_high_TRUE / total, accuracy = 0.1)
+  ) %>%
+  rename(
+    Excess_Flag          = excess_flag,
+    Not_Persistent       = persist_high_FALSE,
+    Also_Persistent_High = persist_high_TRUE,
+    Total                = total,
+    Pct_Also_Persistent  = pct_also_persistent
+  ) %>%
+  kable(caption = "Overlap: Excess Mortality Flags and Persistently High Burden Counties") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+### Key Finding
+
+> Monotonic relationship between excess mortality severity and wave
+> persistence confirms these are not measurement artifacts. The same
+> structural vulnerabilities that produced extreme cumulative death rates
+> also prevented recovery between waves. The 0% overlap at Below Average
+> provides a clean lower boundary validating both classifications.
+
+
+# 4b. Persistently High -- Counties Above Expected Death Rate
+
+> **Identify which states have complete, partial, or zero county coverage
+> in the dataset** 
+
+```{r missing_states_diagnosis}
+
+# Get all US counties from tigris shapefile
+# all_us_counties pre-loaded in tigris_setup chunk
+# No download needed -- using cached version
+
+# Compare against county_totals
+coverage_by_state <- all_us_counties %>%
+  left_join(
+    county_totals %>%
+      dplyr::select(fips, cum_death_rate) %>%
+      mutate(in_dataset = TRUE),
+    by = "fips"
+  ) %>%
+  mutate(in_dataset = replace_na(in_dataset, FALSE)) %>%
+  group_by(STATE_NAME) %>%
+  summarise(
+    total_counties    = n(),
+    counties_in_data  = sum(in_dataset),
+    counties_missing  = sum(!in_dataset),
+    pct_coverage      = scales::percent(
+      sum(in_dataset) / n(), accuracy = 0.1),
+    .groups = "drop"
+  ) %>%
+  arrange(counties_missing %>% desc())
+
+# States with zero coverage
+cat("States with ZERO county coverage:\n")
+coverage_by_state %>%
+  filter(counties_in_data == 0) %>%
+  print()
+
+cat("\nStates with PARTIAL coverage:\n")
+coverage_by_state %>%
+  filter(counties_in_data > 0, counties_missing > 0) %>%
+  print()
+
+cat("\nStates with COMPLETE coverage:\n")
+coverage_by_state %>%
+  filter(counties_missing == 0) %>%
+  print()
+```
+
+> **Potential Coverage Bias:** Assess whether missing states/counties bias
+> findings directionally. Compare demographic profile of missing versus
+> included counties (document potential limitations).
+
+```{r coverage_bias_assessment}
+
+# Compare demographic profile of missing vs present counties
+missing_fips <- all_us_counties %>%
+  left_join(
+    county_totals %>%
+      dplyr::select(fips) %>%
+      mutate(in_dataset = TRUE),
+    by = "fips"
+  ) %>%
+  mutate(in_dataset = replace_na(in_dataset, FALSE)) %>%
+  filter(!in_dataset) %>%
+  pull(fips)
+
+# Get ACS demographics for missing counties
+missing_demos <- county_weekly %>%
+  dplyr::select(fips, total_pop, pct_black, pct_65_over,
+                poverty_rate, median_age, pct_no_cars, pct_less_than_hs) %>%
+  distinct(fips, .keep_all = TRUE) %>%
+  mutate(coverage = if_else(fips %in% missing_fips,
+                            "Missing from Analysis",
+                            "Included in Analysis"))
+
+missing_demos %>%
+  group_by(coverage) %>%
+  summarise(
+    n_counties    = n(),
+    median_pop    = scales::comma(round(median(total_pop,    na.rm = TRUE), 0)),
+    mean_pct_black = scales::percent(mean(pct_black,   na.rm = TRUE), accuracy = 0.1),
+    mean_poverty  = scales::percent(mean(poverty_rate, na.rm = TRUE), accuracy = 0.1),
+    mean_pct_65_over  = scales::percent(mean(pct_65_over,  na.rm = TRUE), accuracy = 0.1),
+    mean_pct_less_than_hs = scales::percent(mean(pct_less_than_hs, na.rm = TRUE), accuracy = 0.1),
+    .groups = "drop"
+  ) %>%
+  kable(caption = paste(
+    "Demographic Comparison: Counties Included vs Missing from Analysis",
+    "-- Directional bias assessment"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Note: our county_totals already filters total_pop >= 5000
+# which excludes the most unstable small-county rate estimates
+# The missing counties with median pop 2,860 would largely
+# be excluded by this filter anyway -- further reducing
+# the practical impact of the coverage gap on core findings
+```
+
+**Interactive Persistently High Burden Counties Map**
+
+```{r leaflet_persistently_high_map}
+library(leaflet)
+library(sf)
+
+# Get county shapefile for just the persistently high counties
+options(tigris_use_cache = TRUE)
+ph_sf <- counties_sf %>%
+  filter(fips %in% persistently_high$fips) %>%
+  left_join(
+    persistently_high %>%
+      dplyr::select(fips, county_name, state_name,
+                    `1_initial`, `5_delta`,
+                    pct_black, pct_65_over,
+                    poverty_rate, total_pop) %>%
+      left_join(
+        all_county_demos %>%
+          dplyr::select(fips, pct_less_than_hs),
+        by = "fips"
+      ),
+    by = "fips"
+  )
+
+# Color palette based on Wave 1 death rate
+pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain  = ph_sf$`1_initial`,
+  na.color = "grey80"
+)
+
+# Build tooltip
+ph_sf <- ph_sf %>%
+  mutate(
+    popup_text = paste0(
+      "<b>", county_name, ", ", state_name, "</b><br>",
+      "<b style='color:#E63946'>Persistently High Burden County</b><br>",
+      "────────────────────<br>",
+      "Wave 1 Death Rate: ", round(`1_initial`, 1), " per 100k<br>",
+      "Delta Death Rate: ",  round(`5_delta`,   1), " per 100k<br>",
+      "────────────────────<br>",
+      "Population: ", scales::comma(total_pop), "<br>",
+      "% Black: ", scales::percent(pct_black, accuracy = 0.1), "<br>",
+      "% Age 65+: ", scales::percent(pct_65_over, accuracy = 0.1), "<br>",
+      "Poverty Rate: ", scales::percent(poverty_rate, accuracy = 0.1), "<br>",
+      "% Without HS Diploma: ",
+      scales::percent(pct_less_than_hs, accuracy = 0.1)
+    )
+  )
+
+leaflet(ph_sf) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor   = ~pal(`1_initial`),
+    fillOpacity = 0.8,
+    color       = "white",
+    weight      = 1.5,
+    popup       = ~popup_text,
+    highlight   = highlightOptions(
+      weight      = 3,
+      color       = "#E63946",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal      = pal,
+    values   = ~`1_initial`,
+    title    = "Wave 1 Death Rate<br>per 100k",
+    position = "bottomright"
+  ) %>%
+  addControl(
+    html = paste0(
+      "<div style='background:white; padding:8px; ",
+      "border-radius:4px; font-size:12px;'>",
+      "<b>157 Persistently High Burden Counties</b><br>",
+      "Top quartile death rate in BOTH<br>",
+      "Wave 1 and Delta wave<br>",
+      "<i>Click any county for demographic profile</i>",
+      "</div>"
+    ),
+    position = "topleft"
+  )
+```
+
+**Choropleth: Cumulative COVID Death Rate per 100K by County**
+
+```{r national_excess_map, fig.cap="Choropleth: Cumulative COVID Death Rate per 100k by County"}
+invisible(gc())  # trigger garbage collection silently -- suppresses memory table output
+# counties_sf pre-loaded in tigris_setup chunk
+# No download needed -- using cached version
+
+map_data <- counties_sf %>%
+  left_join(county_totals, by = "fips")
+
+ggplot(map_data) +
+  geom_sf(aes(fill = cum_death_rate), color = NA) +
+  scale_fill_viridis_c(
+    option    = "magma",
+    direction = -1,
+    name      = "Deaths\nper 100k",
+    na.value  = "grey85",
+    labels    = comma
+  ) +
+  labs(
+    title    = "Cumulative COVID-19 Death Rate per 100k by County",
+    subtitle = "March 2020 - September 2022 | Grey = no data in source pipeline",
+    caption  = paste0(
+      "Source: Google COVID-19 Open Data + ACS 2019 5-Year | ",
+    "Coverage: 2,904 of ~3,143 US counties (92%) | ",
+    "6 states have zero coverage (AL, AR, AZ, CA, CO, CT) -- ",
+    "see Section 11 for bias assessment | ",
+    "Interactive state-level map planned for Phase 2 ",
+    "with complete national coverage"
+    )
+  ) +
+  theme_void(base_size = 13) +
+  theme(legend.position = "right")
+```
+
+
+# 5. Case-Fatality Relationship by County
+
+> **Relationship Between Cumulative Case Rate and Death Rate by County**
+
+```{r cfr_scatter, fig.cap="Relationship between cumulative case rate and death rate by county"}
+library(plotly)
+
+# Build tooltip text for county points
+cfr_plot_data <- county_totals %>%
+  filter(!is.na(cfr_overall), cfr_overall < 0.3) %>%
+  mutate(
+    tooltip_text = paste0(
+      "<b>", county_name, ", ", state_name, "</b><br>",
+      "Death Rate: ",  round(cum_death_rate, 1), " per 100k<br>",
+      "Case Rate: ",   round(cum_case_rate,  1), " per 100k<br>",
+      "CFR: ",         scales::percent(cfr_overall, accuracy = 0.1), "<br>",
+      "Population: ",  scales::comma(total_pop), "<br>",
+      "% Age 65+: ",   scales::percent(pct_65_over,  accuracy = 0.1), "<br>",
+      "Poverty Rate: ",scales::percent(poverty_rate, accuracy = 0.1), "<br>",
+      "% Black: ",     scales::percent(pct_black,    accuracy = 0.1)
+    )
+  )
+
+# Fit the regression model explicitly to build
+# tooltip-bearing reference points along the line
+lm_fit    <- lm(cum_death_rate ~ cum_case_rate, data = cfr_plot_data)
+lm_r2     <- summary(lm_fit)$r.squared
+lm_slope  <- coef(lm_fit)[2]
+lm_int    <- coef(lm_fit)[1]
+lm_pval   <- summary(lm_fit)$coefficients[2, 4]
+
+# Build 50 reference points along the regression line
+# These carry the tooltip and are rendered as invisible points
+case_range <- seq(min(cfr_plot_data$cum_case_rate, na.rm = TRUE),
+                  max(cfr_plot_data$cum_case_rate, na.rm = TRUE),
+                  length.out = 50)
+
+lm_line_data <- tibble(
+  cum_case_rate  = case_range,
+  cum_death_rate = lm_int + lm_slope * case_range,
+  tooltip_text   = paste0(
+    "<b>National OLS Regression Line</b><br>",
+    "At this case rate: ",
+    scales::comma(round(case_range, 0)), " per 100k<br>",
+    "Expected death rate: ",
+    round(lm_int + lm_slope * case_range, 1), " per 100k<br>",
+    "────────────────────<br>",
+    "Slope: ", round(lm_slope, 4),
+    " deaths per case (per 100k)<br>",
+    "Intercept: ", round(lm_int, 1), "<br>",
+    "R²: ", round(lm_r2, 3), "<br>",
+    "p-value: ", scales::pvalue(lm_pval), "<br>",
+    "────────────────────<br>",
+    "<i>Points above this line = higher than",
+    " expected death rate</i><br>",
+    "<i>Points below = lower than expected</i>"
+  )
+)
+
+# Build confidence interval band data
+pred_data  <- predict(lm_fit,
+                      newdata   = tibble(cum_case_rate = case_range),
+                      interval  = "confidence",
+                      level     = 0.95) %>%
+  as_tibble() %>%
+  mutate(
+    cum_case_rate = case_range,
+    tooltip_text  = paste0(
+      "<b>95% Confidence Band</b><br>",
+      "At case rate: ",
+      scales::comma(round(case_range, 0)), " per 100k<br>",
+      "Expected death rate: ", round(fit,  1), " per 100k<br>",
+      "95% CI lower: ",        round(lwr,  1), " per 100k<br>",
+      "95% CI upper: ",        round(upr,  1), " per 100k<br>",
+      "────────────────────<br>",
+      "<i>Band width reflects uncertainty in the",
+      " national average at each case rate level</i>"
+    )
+  )
+
+# Build the plot
+p_cfr <- ggplot() +
+
+  # Confidence band as ribbon -- invisible fill, tooltip via points
+  geom_ribbon(data = pred_data,
+              aes(x = cum_case_rate, ymin = lwr, ymax = upr),
+              fill = "grey70", alpha = 0.25, inherit.aes = FALSE) +
+
+  # Invisible points along CI band upper edge for tooltips
+  geom_point(data = pred_data,
+             aes(x = cum_case_rate, y = upr, text = tooltip_text),
+             size = 0, alpha = 0, inherit.aes = FALSE) +
+
+  # Invisible points along CI band lower edge for tooltips
+  geom_point(data = pred_data,
+             aes(x = cum_case_rate, y = lwr, text = tooltip_text),
+             size = 0, alpha = 0, inherit.aes = FALSE) +
+
+  # County scatter points
+  geom_point(data = cfr_plot_data,
+             aes(x     = cum_case_rate,
+                 y     = cum_death_rate,
+                 color = pct_65_over,
+                 size  = total_pop,
+                 text  = tooltip_text),
+             alpha = 0.6) +
+
+  # Regression line as visible dashed line
+  geom_line(data = lm_line_data,
+            aes(x = cum_case_rate, y = cum_death_rate),
+            color    = "black",
+            linewidth = 0.8,
+            linetype = "dashed",
+            inherit.aes = FALSE) +
+
+  # Invisible points along regression line carrying tooltip
+  geom_point(data = lm_line_data,
+             aes(x = cum_case_rate, y = cum_death_rate,
+                 text = tooltip_text),
+             size = 0, alpha = 0, inherit.aes = FALSE) +
+
+  scale_color_viridis_c(
+    name   = "% Age 65+",
+    labels = percent,
+    option = "viridis"
+  ) +
+  scale_size_continuous(
+    name   = "Population",
+    labels = comma,
+    range  = c(0.5, 6)
+  ) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Cumulative Case Rate vs. Death Rate by County",
+    subtitle = paste0(
+      "Color = % population 65+  |  Size = county population  |  ",
+      "Hover points OR regression line for detail"
+    ),
+    x       = "Cumulative Cases per 100k",
+    y       = "Cumulative Deaths per 100k",
+    caption = "Dashed line = OLS fit | Grey band = 95% confidence interval"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Convert to interactive plotly
+ggplotly(p_cfr, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(
+      bgcolor     = "white",
+      font        = list(size = 12),
+      bordercolor = "grey40"
+    ),
+    legend = list(orientation = "v", x = 1.05)
+  )
+```
+
+```{r cfr_by_wave, fig.cap="Case fatality ratio over time by vaccine era"}
+county_weekly %>%
+  filter(new_deceased_wk >= 0, new_confirmed_wk > 0) %>%
+  mutate(
+    vaccine_era_label = recode(vaccine_era,
+      "pre_vaccine"        = "Pre-Vaccine",
+      "early_rollout"      = "Early Rollout",
+      "broad_availability" = "Broad Availability"
+    )
+  ) %>%
+  group_by(week_start, vaccine_era_label) %>%
+  summarise(
+    cfr_wk = sum(new_deceased_wk, na.rm = TRUE) /
+              pmax(sum(new_confirmed_wk, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week_start, y = cfr_wk,
+             color = vaccine_era_label,
+             group = vaccine_era_label)) +
+  geom_line(alpha = 0.2, linewidth = 0.4) +
+  geom_smooth(method    = "loess",
+              se        = FALSE,
+              linewidth = 1.8,
+              span      = 0.3) +
+  scale_color_manual(
+    values = c(
+      "Pre-Vaccine"        = "#E63946",
+      "Early Rollout"      = "#457B9D",
+      "Broad Availability" = "#2A9D8F"
+    ),
+    name = "Vaccine Era"
+  ) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = percent, limits = c(0, 0.15)) +
+  annotate("text",
+           x     = as.Date("2020-04-15"),
+           y     = 0.105,
+           label = "Testing scarcity\nmasks true IFR",
+           size  = 3.2,
+           color = "#E63946",
+           hjust = 0) +
+  annotate("text",
+           x     = as.Date("2021-02-01"),
+           y     = 0.055,
+           label = "Early doses\nto highest risk",
+           size  = 3.2,
+           color = "#457B9D",
+           hjust = 0) +
+  annotate("text",
+           x     = as.Date("2022-01-01"),
+           y     = 0.055,
+           label = "Omicron\nattenuation",
+           size  = 3.2,
+           color = "#2A9D8F",
+           hjust = 0) +
+  labs(
+    title    = "National Case Fatality Ratio Over Time",
+    subtitle = "Smoothed weekly CFR by vaccine era",
+    x        = NULL,
+    y        = "Case Fatality Ratio"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+
+
+# 6. Demographic Drivers of Death Rate
+
+Before building the formal regression model in Section 7, this 
+section examines how individual demographic characteristics relate 
+to county COVID death rates. This serves as an analytical screening 
+step — identifying which variables deserve inclusion in the model 
+and previewing the direction of each relationship.
+
+### Reading the Correlation Table
+
+Pearson correlation measures the linear relationship between two 
+variables on a scale from -1.0 to 1.0. A value close to 1.0 means 
+the two variables tend to rise and fall together — as one increases 
+the other increases. A value close to -1.0 means they move in 
+opposite directions — as one increases the other decreases. A value 
+near zero means little to no linear relationship exists between them.
+
+The table below ranks each demographic variable by the strength of 
+its relationship with cumulative COVID death rate. Variables near 
+the top of the list are the strongest candidates for the regression 
+model. Variables near the bottom have weaker relationships and may 
+lose statistical significance after other factors are controlled for.
+
+> **Important Limitation:** Correlation measures association, not 
+> causation. A strong correlation between two variables does not 
+> mean one caused the other. Many of these demographic 
+> characteristics are themselves correlated with each other — 
+> counties with high poverty rates also tend to have lower 
+> educational attainment, for example. The regression model in 
+> Section 7 formally separates these overlapping relationships 
+> to identify which factors have independent predictive power 
+> after controlling for the others.
+
+```{r demographic_correlations}
+demo_vars <- county_totals %>%
+  dplyr::select(cum_death_rate, pct_65_over, pct_black, pct_hispanic,
+         pct_white, poverty_rate, pct_no_cars, median_age,
+         pop_per_housing_unit, pct_less_than_hs) %>%
+  drop_na()
+
+cor(demo_vars, use = "complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  select(variable, cum_death_rate) %>%
+  filter(variable != "cum_death_rate") %>%
+  arrange(desc(abs(cum_death_rate))) %>%
+  mutate(cum_death_rate = round(cum_death_rate, 3)) %>%
+  rename(correlation_with_death_rate = cum_death_rate) %>%
+  mutate(variable = recode(variable,
+    "pct_less_than_hs"     = "% Without HS Diploma",
+    "poverty_rate"         = "Poverty Rate",
+    "pct_65_over"          = "% Age 65+",
+    "pct_black"            = "% Black Population",
+    "pct_no_cars"          = "% No Car Access",
+    "pct_white"            = "% White Population",
+    "median_age"           = "Median Age",
+    "pop_per_housing_unit" = "Pop. per Housing Unit",
+    "pct_hispanic"         = "% Hispanic Population"
+  )) %>%
+  kable(caption = "Pearson Correlation: Demographic Variables vs. Cumulative Death Rate") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### COVID Death Rates by Black Population Share
+
+The correlation table identifies Black population share as the 
+fourth strongest predictor of county COVID death rates. Combined 
+with the finding that persistently high burden counties have nearly 
+three times the national average Black population share (22.9% vs 
+8.4%), a closer examination of how death rates vary across counties 
+grouped by Black population concentration is warranted.
+
+The chart below divides all counties into four equal groups — 
+quartiles — ranked from lowest to highest Black population share. 
+If Black population share has a meaningful relationship with COVID 
+mortality the groups with higher Black population shares should 
+show systematically higher death rates.
+
+> **Analytical Note:** This analysis examines population-level 
+> patterns at the county level — not individual-level outcomes. 
+> A county with a high Black population share experiencing elevated 
+> death rates does not mean Black residents specifically drove that 
+> outcome. It means something about the structural characteristics 
+> of counties with those demographic profiles — healthcare access, 
+> poverty, educational attainment — predicted worse outcomes. The 
+> regression model in Section 7 formally tests which structural 
+> factors explain this pattern.
+
+```{r race_boxplots, fig.cap="Death rate patterns by Black population quartile"}
+library(patchwork)
+
+# Prepare quartile data
+race_data <- county_totals %>%
+  mutate(
+    pct_black_q = ntile(pct_black, 4),
+    pct_black_q = factor(pct_black_q,
+                         labels = c("Q1\n(0-3% Black)",
+                                    "Q2\n(3-9% Black)",
+                                    "Q3\n(9-25% Black)",
+                                    "Q4\n(25-73% Black)"))
+  ) %>%
+  filter(!is.na(pct_black_q))
+
+# Panel 1: Mean death rate with error bars -- clearest view of shift
+p1 <- race_data %>%
+  group_by(pct_black_q) %>%
+  summarise(
+    mean_dr = mean(cum_death_rate,  na.rm = TRUE),
+    se_dr   = sd(cum_death_rate,    na.rm = TRUE) /
+              sqrt(n()),
+    n       = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = pct_black_q, y = mean_dr, fill = pct_black_q)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_errorbar(aes(ymin = mean_dr - 1.96 * se_dr,
+                    ymax = mean_dr + 1.96 * se_dr),
+                width = 0.2, linewidth = 0.8) +
+  geom_text(aes(label = paste0(round(mean_dr, 0), "\nper 100k")),
+            vjust = -0.8, size = 3.2, fontface = "bold") +
+  scale_fill_brewer(palette = "Reds") +
+  scale_y_continuous(labels = comma,
+                     limits = c(0, 500)) +
+  labs(
+    title    = "Mean Death Rate by Quartile",
+    subtitle = "Error bars = 95% CI",
+    x        = "% Black Population Quartile",
+    y        = "Mean Deaths per 100k"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Panel 2: Proportion of extreme mortality counties per quartile
+p2 <- race_data %>%
+  mutate(extreme = cum_death_rate >
+           (mean(cum_death_rate, na.rm = TRUE) +
+            2 * sd(cum_death_rate, na.rm = TRUE))) %>%
+  group_by(pct_black_q) %>%
+  summarise(
+    pct_extreme = mean(extreme, na.rm = TRUE),
+    n           = n(),
+    .groups     = "drop"
+  ) %>%
+  ggplot(aes(x = pct_black_q, y = pct_extreme, fill = pct_black_q)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = scales::percent(pct_extreme, accuracy = 0.1)),
+            vjust = -0.5, size = 3.2, fontface = "bold") +
+  scale_fill_brewer(palette = "Reds") +
+  scale_y_continuous(labels = percent,
+                     limits = c(0, 0.12)) +
+  labs(
+    title    = "% of Counties with Extreme Mortality",
+    subtitle = ">2 SD above national mean",
+    x        = "% Black Population Quartile",
+    y        = "% of Counties Flagged Extreme"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Panel 3: Cumulative death rate density by quartile
+p3 <- race_data %>%
+  ggplot(aes(x = cum_death_rate,
+             fill = pct_black_q,
+             color = pct_black_q)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_brewer(palette  = "Reds", name = "Quartile") +
+  scale_color_brewer(palette = "Reds", name = "Quartile") +
+  scale_x_continuous(labels = comma, limits = c(0, 900)) +
+  labs(
+    title    = "Death Rate Distribution by Quartile",
+    subtitle = "Right tail shift visible in Q3/Q4",
+    x        = "Cumulative Deaths per 100k",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Compose with patchwork
+(p1 | p2) / p3 +
+  plot_annotation(
+    title   = "COVID-19 Death Rate by County Black Population Share",
+    subtitle = paste0(
+      "Disparity is concentrated in extreme mortality counties ",
+      "rather than uniform shift across all counties"
+    ),
+    caption = "Quartile ranges: Q1=0-3%, Q2=3-9%, Q3=9-25%, Q4=25-73% Black population share"
+  )
+```
+
+
+
+# 7. Excess Mortality Regression Model
+
+To formally test whether structural factors predicted county COVID 
+death rates after controlling for age, a Negative Binomial regression 
+model was fitted to cumulative county death counts. This model was 
+chosen over simpler alternatives because COVID death counts are 
+overdispersed — the variation between counties is far greater than 
+a standard Poisson model assumes. The Negative Binomial model 
+handles this property correctly and produces honest confidence 
+intervals as a result.
+
+Counties with zero recorded deaths and populations below 5,000 
+were excluded from the model. Very small counties produce 
+statistically unstable rates — a single death in a community 
+of 800 people generates a death rate that looks catastrophic 
+per 100,000 but represents one family's loss rather than a 
+systematic pattern.
+
+> **How to Read the Results:** The model produces Incidence Rate 
+> Ratios (IRR) for each variable. An IRR greater than 1.0 means 
+> that factor is associated with a higher death rate. An IRR less 
+> than 1.0 means it is associated with a lower death rate. An IRR 
+> of exactly 1.0 means no relationship. The further a value sits 
+> from 1.0 in either direction, the stronger the relationship.
+>
+> For example, an IRR of 3.7 for poverty rate means counties with 
+> the highest poverty rates had approximately 3.7 times the expected 
+> death rate of counties with the lowest poverty rates, after 
+> accounting for every other variable in the model simultaneously.
+>
+> **Statistical significance** is indicated in the Significant 
+> column. Variables marked Yes have relationships strong enough 
+> that we can be confident they are real rather than the result 
+> of random chance. Variables marked No — specifically Black 
+> population share and car access — did not retain independent 
+> statistical significance after structural factors were controlled 
+> for. This is itself an important finding, explained below.
+
+
+```{r nb_model}
+model_data <- county_totals %>%
+  dplyr::select(total_deceased, total_pop, pct_65_over, pct_black,
+         pct_hispanic, poverty_rate, pct_no_cars, median_age,
+         pop_per_housing_unit, pct_less_than_hs) %>%
+  drop_na() %>%
+  filter(total_deceased > 0, total_pop > 5000)
+
+nb_model <- glm.nb(
+  total_deceased ~
+    offset(log(total_pop)) +
+    pct_65_over +
+    pct_black +
+    pct_hispanic +
+    poverty_rate +
+    pct_no_cars +
+    median_age +
+    pop_per_housing_unit +
+    pct_less_than_hs,
+  data = model_data
+)
+
+summary(nb_model)
+```
+
+```{r model_irr_table}
+tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~round(., 3)),
+         p.value     = scales::pvalue(p.value),
+         significant = if_else(p.value < 0.05, "Yes", "No")) %>%
+  rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high) %>%
+  kable(caption = "Negative Binomial Model: Incidence Rate Ratios") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### What the Model Found
+
+The results challenge the dominant narrative of the pandemic 
+response in important ways.
+
+**Education was the strongest predictor.** Counties where more 
+adults lack a high school diploma had dramatically higher COVID 
+death rates — an IRR of 85.5 — after accounting for age, race, 
+poverty, and every other variable simultaneously. This is not 
+primarily a story about individual health decisions. Educational 
+attainment at the county level reflects decades of investment 
+in schools, economic opportunity, healthcare access, and 
+community infrastructure. Counties with lower educational 
+attainment had less of everything that protects a community 
+during a health emergency.
+
+**Age mattered, but less than education.** The federal COVID 
+response was organized almost entirely around age as the primary 
+risk factor — vaccine priority tiers, hospital protocols, and 
+public messaging all centered on protecting elderly populations. 
+Age was indeed a significant predictor with an IRR of 128. 
+However its confidence interval is extremely wide (51 to 324) 
+reflecting statistical uncertainty, while education's confidence 
+interval is tighter (51 to 143) making it the more precisely 
+estimated predictor of the two.
+
+**Poverty independently predicted death rates.** An IRR of 3.7 
+for poverty rate means high-poverty counties had nearly four 
+times the expected death rate of low-poverty counties after 
+controlling for everything else. Poverty and education are 
+related but the model confirms they represent distinct 
+dimensions of structural vulnerability — both matter 
+independently.
+
+**Hispanic population share was protective.** After controlling 
+for poverty and education, counties with higher Hispanic 
+population shares had lower expected death rates — an IRR of 
+0.73. This is consistent with what epidemiologists call the 
+Hispanic Health Paradox — Hispanic communities in the United 
+States consistently show better health outcomes than their 
+socioeconomic characteristics alone would predict.
+
+**Black population share was not a statistically significant 
+independent predictor.** This is the finding that most directly 
+speaks to structural inequity. After controlling for educational 
+attainment and poverty — the structural conditions that 
+disproportionately characterize majority Black counties due to 
+historical policy choices — Black population share itself had 
+no statistically significant independent effect on death rates 
+(IRR 0.958, p=0.425). The disparity documented throughout this 
+analysis is real and severe. But it is not explained by race 
+as an inherent risk factor. It is explained by the structural 
+conditions that were imposed on these communities over 
+generations and that COVID exposed with devastating clarity.
+
+> **What This Means for Policy:** You cannot address the 
+> mortality disparity documented in this analysis by targeting 
+> race as a category. The data says the intervention points 
+> are educational investment, poverty reduction, and healthcare 
+> infrastructure in structurally disadvantaged communities — 
+> which disproportionately but not exclusively serve majority 
+> Black populations in the Deep South. Targeting the structural 
+> conditions rather than the demographic category is both more 
+> analytically defensible and more likely to produce lasting 
+> change.
+
+```{r irr_forest_plot, fig.cap="Forest plot of Incidence Rate Ratios"}
+library(plotly)
+
+irr_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term_clean = recode(term,
+      pct_65_over          = "% Age 65+",
+      pct_black            = "% Black Population",
+      pct_hispanic         = "% Hispanic Population",
+      poverty_rate         = "Poverty Rate",
+      pct_no_cars          = "% No Car Access",
+      median_age           = "Median Age",
+      pop_per_housing_unit = "Pop. per Housing Unit",
+      pct_less_than_hs     = "% Without HS Diploma"
+    ),
+    direction = if_else(estimate > 1, "Risk Factor", "Protective"),
+
+    # Plain language interpretation for tooltip
+    plain_language = case_when(
+      term == "pct_less_than_hs" ~ paste0(
+        "Counties with the highest share of adults\n",
+        "without a high school diploma have\n",
+        round(estimate, 1), "x the expected death rate\n",
+        "of counties with the lowest share,\n",
+        "after controlling for all other factors."
+      ),
+      term == "pct_65_over" ~ paste0(
+        "Counties with the highest elderly population\n",
+        "share have ", round(estimate, 1), "x the expected\n",
+        "death rate of counties with the lowest share,\n",
+        "after controlling for all other factors."
+      ),
+      term == "poverty_rate" ~ paste0(
+        "Counties with the highest poverty rates\n",
+        "have ", round(estimate, 2), "x the expected death rate\n",
+        "of counties with the lowest poverty rates,\n",
+        "after controlling for all other factors."
+      ),
+      term == "pop_per_housing_unit" ~ paste0(
+        "Each additional person per housing unit\n",
+        "multiplies the expected death rate by ",
+        round(estimate, 3), ".\n",
+        "Crowding independently amplifies transmission risk."
+      ),
+      term == "median_age" ~ paste0(
+        "After controlling for % age 65+,\n",
+        "higher median age is associated with\n",
+        round((1 - estimate) * 100, 1), "% LOWER expected death rate.\n",
+        "Likely reflects affluent retirement communities\n",
+        "with better healthcare access."
+      ),
+      term == "pct_black" ~ paste0(
+        "After controlling for education and poverty,\n",
+        "Black population share has NO statistically\n",
+        "significant independent effect (p=0.425).\n",
+        "The disparity observed in Black communities\n",
+        "is explained by structural conditions --\n",
+        "not race as an independent risk factor."
+      ),
+      term == "pct_no_cars" ~ paste0(
+        "No Car Access is NOT statistically significant\n",
+        "after controlling for poverty and education.\n",
+        "The wide confidence interval (0.32 to 2.26)\n",
+        "reflects high uncertainty in this estimate."
+      ),
+      term == "pct_hispanic" ~ paste0(
+        "After controlling for poverty and education,\n",
+        "higher Hispanic population share is associated\n",
+        "with ", round((1 - estimate) * 100, 1), "% LOWER expected death rate.\n",
+        "Consistent with the Hispanic Health Paradox --\n",
+        "better outcomes than socioeconomic factors predict."
+      )
+    ),
+
+    # Full tooltip text
+    tooltip_text = paste0(
+      "<b>", term_clean, "</b><br>",
+      "────────────────────────<br>",
+      "<b>IRR: ", round(estimate, 3), "</b>",
+      "  (", round(conf.low, 3), " to ", round(conf.high, 3), ")<br>",
+      "p-value: ", scales::pvalue(p.value), "<br>",
+      "Significant: ", if_else(p.value < 0.05, "Yes ✓", "No ✗"), "<br>",
+      "────────────────────────<br>",
+      "<i>", plain_language, "</i>"
+    )
+  )
+
+# Build forest plot
+p_forest <- ggplot(irr_data,
+                   aes(x    = estimate,
+                       y    = reorder(term_clean, estimate),
+                       color = direction,
+                       text  = tooltip_text)) +
+  geom_vline(xintercept = 1,
+             linetype   = "dashed",
+             color      = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height    = 0.2,
+                 color     = "grey40") +
+  geom_point(size = 4) +
+  scale_color_manual(
+    values = c("Risk Factor" = "#E63946",
+               "Protective"  = "#457B9D"),
+    name   = NULL
+  ) +
+  scale_x_log10(
+    breaks = c(0.5, 0.75, 1, 1.5, 2, 5, 10, 50, 100, 200),
+    labels = c("0.5", "0.75", "1", "1.5", "2", "5",
+               "10", "50", "100", "200")
+  ) +
+  labs(
+    title    = "Incidence Rate Ratios: County COVID-19 Death Rate",
+    subtitle = "Negative Binomial Model | Log scale | Hover each point for plain language interpretation",
+    x        = "Incidence Rate Ratio (IRR) — Log Scale",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+# Convert to interactive plotly
+ggplotly(p_forest, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(
+      bgcolor     = "white",
+      font        = list(size = 12),
+      bordercolor = "grey40",
+      align       = "left"
+    ),
+    legend = list(orientation = "h", y = -0.15)
+  )
+```
+
+# 8. Seasonal Decomposition
+
+Respiratory diseases have long followed seasonal patterns — 
+winter brings people indoors, reduces ventilation, lowers 
+vitamin D levels, and creates conditions that favor airborne 
+transmission. Influenza, RSV, and the common cold all peak 
+in the November through February window in the Northern 
+Hemisphere. The question for COVID-19 is whether it followed 
+the same pattern — and if so, what that tells us about the 
+communities that were already structurally vulnerable when 
+winter arrived.
+
+To answer this, STL decomposition was applied to the national 
+weekly death rate time series. STL — Seasonal-Trend 
+decomposition using Loess — mathematically separates a time 
+series into three distinct components:
+
+- **Trend** — the underlying long-term direction of mortality, 
+  smoothed across a 13-week window (one meteorological season) 
+  to remove short-term noise
+- **Seasonal** — the repeating annual cycle of higher winter 
+  and lower summer mortality, extracted as the pattern that 
+  recurs at the same time each year
+- **Remainder** — what is left after trend and season are 
+  removed; genuine anomalies that neither the long-term 
+  direction nor the calendar can explain
+
+STL was chosen over classical decomposition methods because 
+it is robust to outliers — a pandemic with multiple extreme 
+waves requires a decomposition method that can identify 
+seasonal patterns without being distorted by the waves 
+themselves.
+
+> **Why This Matters for Structural Inequity:** If COVID 
+> mortality followed consistent seasonal patterns, the 
+> communities identified throughout this analysis as 
+> persistently high burden were not just exposed to higher 
+> baseline mortality — they were exposed to that higher 
+> baseline amplified by the same winter seasonality as 
+> everyone else. A community already at 400 deaths per 100k 
+> cumulative burden entering November faces a different 
+> winter than a community at 150 deaths per 100k. Seasonal 
+> amplification compounds existing structural disadvantage.
+````
+
+```{r stl_decomposition, fig.cap="STL decomposition of national weekly death rate"}
+# ============================================================
+# SEASONAL PREP + STL DECOMPOSITION -- combined into one chunk
+# to ensure stl_fit is available in the knit environment
+# ============================================================
+
+national_ts <- county_weekly %>%
+  group_by(week_start) %>%
+  summarise(
+    death_rate_nat = weighted.mean(death_rate_wk,
+                                   total_pop, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(week_start) %>%
+  filter(!is.na(death_rate_nat))
+
+national_tsibble <- national_ts %>%
+  mutate(week = yearweek(week_start)) %>%
+  as_tsibble(index = week)
+
+stl_fit <- national_tsibble %>%
+  model(STL(death_rate_nat ~ trend(window = 13) +
+              season(window = "periodic")))
+
+# Extract components
+stl_components <- components(stl_fit)
+
+stl_df <- stl_components %>%
+  as_tibble() %>%
+  mutate(date = as.Date(week))
+
+stl_long <- stl_df %>%
+  dplyr::select(date, death_rate_nat, trend,
+                season_year, remainder) %>%
+  pivot_longer(
+    cols      = c(death_rate_nat, trend,
+                  season_year, remainder),
+    names_to  = "component",
+    values_to = "value"
+  ) %>%
+  mutate(
+    component = factor(component,
+      levels = c("death_rate_nat", "trend",
+                 "season_year",    "remainder"),
+      labels = c(
+        "Observed Death Rate",
+        "Long-Term Trend\n(13-week smoothing window)",
+        "Seasonal Component\n(repeating winter/summer cycle)",
+        "Remainder\n(unexplained after trend + season)"
+      )
+    )
+  )
+
+winter_bands <- tibble(
+  xmin  = as.Date(c("2020-11-01", "2021-11-01")),
+  xmax  = as.Date(c("2021-02-28", "2022-02-28")),
+  label = c("Winter\n2020-21", "Winter\n2021-22")
+)
+
+ggplot(stl_long, aes(x = date, y = value)) +
+  geom_rect(
+    data        = winter_bands,
+    aes(xmin = xmin, xmax = xmax,
+        ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill        = "#AED6F1",
+    alpha       = 0.25
+  ) +
+  geom_hline(yintercept = 0,
+             linetype   = "dotted",
+             color      = "grey60",
+             linewidth  = 0.5) +
+  geom_line(color = "#2C3E50", linewidth = 0.7) +
+  geom_vline(
+    data = data.frame(
+      component = factor(
+        "Remainder\n(unexplained after trend + season)",
+        levels    = levels(stl_long$component)
+      ),
+      date = as.Date("2021-09-01")
+    ),
+    aes(xintercept = date),
+    color       = "#E63946",
+    linetype    = "dashed",
+    linewidth   = 0.8,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~component,
+             ncol           = 1,
+             scales         = "free_y",
+             strip.position = "left") +
+  scale_x_date(
+    date_breaks  = "3 months",
+    date_labels  = "%b %Y",
+    minor_breaks = NULL
+  ) +
+  scale_y_continuous(
+    labels = number_format(accuracy = 0.1)
+  ) +
+  labs(
+    title    = "STL Decomposition: National Weekly COVID Death Rate",
+    subtitle = paste0(
+      "Blue shading = winter months (Nov-Feb) | ",
+      "Red dashed line = Delta variant anomaly | ",
+      "Dotted line = zero reference"
+    ),
+    x       = NULL,
+    y       = "Deaths per 100k",
+    caption = paste0(
+      "STL = Seasonal-Trend decomposition via Loess | ",
+      "Trend window = 13 weeks (one meteorological season) | ",
+      "Seasonal window = periodic (same pattern assumed each year)"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.placement  = "outside",
+    strip.text.y     = element_text(
+      angle    = 0,
+      hjust    = 1,
+      size     = 9,
+      face     = "bold",
+      color    = "#2C3E50"
+    ),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    panel.spacing    = unit(0.8, "lines"),
+    plot.subtitle    = element_text(size = 9, color = "grey40"),
+    plot.caption     = element_text(size = 8, color = "grey50"),
+    plot.margin      = margin(t = 10, r = 10,
+                              b = 10, l = 120, unit = "pt")
+  )
+```
+
+### Reading the Decomposition
+
+The four panels work together to tell a complete story about 
+what drove national COVID mortality at any given moment.
+
+**Panel 1 — Observed Death Rate** is simply the raw weekly 
+data — the actual measured mortality rate before any 
+mathematical separation. The pandemic waves are all visible 
+here: the initial spring 2020 outbreak, the summer 2020 
+Sunbelt surge, the catastrophic winter 2020-2021 peak, the 
+Delta spike, and the Omicron surge followed by decline.
+
+**Panel 2 — Long-Term Trend** shows the pandemic's fundamental 
+momentum after seasonal noise is removed. Two sustained peaks 
+are visible — the winter 2020-2021 period and the Delta-Omicron 
+period — separated by the spring and summer 2021 trough when 
+vaccination was reducing deaths before Delta arrived. 
+Importantly the trend never fully returns to zero before the 
+analysis period ends in September 2022, consistent with the 
+persistent background mortality documented in Hypothesis 2.
+
+**Panel 3 — Seasonal Component** is the most analytically 
+important panel for understanding community vulnerability. 
+The pattern is clear and consistent across both full years 
+visible in the data — peaks in the November through February 
+winter window and troughs in the June through August summer 
+months. The seasonal component swings approximately 5 deaths 
+per 100k above and below the trend — a substantial amplifier 
+relative to the overall death rate scale. Winter made COVID 
+worse. It did so consistently. And it did so on top of 
+whatever structural burden a community was already carrying.
+
+**Panel 4 — Remainder** is largely random noise oscillating 
+around zero — which is what a well-specified decomposition 
+should produce. The one meaningful exception is the sharp 
+positive spike marked with a red dashed line around September 
+2021. That is the Delta wave's sudden emergence — more abrupt 
+and more severe than the seasonal pattern predicted, producing 
+a residual that neither trend nor calendar can explain. Delta 
+was a genuinely anomalous event, not simply an amplified 
+seasonal peak.
+
+> **The Seasonal Leading Indicator:** The seasonal component 
+> begins rising in October — several weeks before the 
+> meteorological definition of winter in November. This 
+> leading pattern is epidemiologically accurate. People move 
+> indoors in early fall as temperatures drop, creating 
+> transmission conditions before the calendar catches up. 
+> For the communities bearing the highest structural burden 
+> this means the dangerous period begins earlier than winter 
+> messaging typically acknowledges.
+
+
+```{r seasonal_by_wave, fig.cap="Monthly death rate by year"}
+seasonal_summary <- county_weekly %>%
+  mutate(
+    month_label = month(week_start, label = TRUE, abbr = TRUE),
+    year_fct    = factor(year)
+  ) %>%
+  group_by(month_label, year_fct) %>%
+  summarise(
+    death_rate_avg = weighted.mean(death_rate_wk,
+                                   total_pop, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(month_label))
+
+max_rate <- max(seasonal_summary$death_rate_avg, na.rm = TRUE)
+
+ggplot(seasonal_summary,
+       aes(x     = month_label,
+           y     = death_rate_avg,
+           color = year_fct,
+           group = year_fct)) +
+
+  # Lines and points first
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+
+  # Winter shading using geom_tile as background
+  # One tile per winter month, full height
+  geom_tile(
+    data = seasonal_summary %>%
+      filter(month_label %in% c("Jan", "Feb", "Nov", "Dec")) %>%
+      dplyr::select(month_label) %>%
+      distinct() %>%
+      mutate(y_mid = max_rate / 2,
+             height = max_rate * 1.2),
+    aes(x      = month_label,
+        y      = y_mid,
+        height = height),
+    fill        = "#AED6F1",
+    alpha       = 0.3,
+    inherit.aes = FALSE,
+    width       = 1.0
+  ) +
+
+  # Redraw lines and points on top of shading
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+
+  scale_color_brewer(palette = "Set1", name = "Year") +
+
+  labs(
+    title    = "Average Weekly Death Rate by Month and Year",
+    subtitle = paste0(
+      "Population-weighted national average | ",
+      "Blue shading = winter months (Jan, Feb, Nov, Dec) | ",
+      "Summer trough near zero in 2021 and 2022"
+    ),
+    x       = "Month",
+    y       = "Avg Weekly Deaths per 100k"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(size = 11)
+  )
+```
+
+### Seasonal Patterns Across Three Years
+
+The month-by-year chart confirms that the seasonal pattern 
+identified in the decomposition is not a mathematical artifact 
+— it is visible in the raw monthly averages across all three 
+years of the analysis period.
+
+**2021 shows the clearest seasonal shape** — starting high in 
+January as the winter 2020-2021 surge peaked, dropping 
+steadily through spring and summer to near zero in June and 
+July, then rising sharply in September as Delta emerged 
+simultaneously with autumn. The summer floor and autumn rise 
+are exactly what the seasonal component predicted.
+
+**2022 shows the post-Omicron floor** — the lowest death rates 
+of any year across almost every month, consistent with 
+Hypothesis 2's finding of structural decline in case lethality. 
+But the seasonal shape persists — near zero in summer, rising 
+in fall — confirming that seasonality continued even as the 
+overall mortality level declined dramatically.
+
+**2020 is the anomalous year** — the pandemic arrived in the 
+wrong season. The April peak reflects the initial uncontrolled 
+outbreak hitting a population with zero immunity and zero 
+treatment protocols before lockdowns suppressed transmission 
+through late spring. The 2020 line maps almost precisely onto 
+the policy decisions of that year — lockdowns, reopenings, 
+and the arrival of winter without adequate preparation — 
+rather than the biological seasonal pattern that 2021 and 
+2022 would establish.
+
+> **Seasonal Equity Note:** The consistent summer trough — 
+> near zero in both 2021 and 2022 regardless of variant or 
+> vaccination status — suggests that summer provided genuine 
+> biological relief to all communities. The communities 
+> documented in this analysis as persistently high burden 
+> did not escape that summer relief. But they entered each 
+> autumn with higher cumulative burden, less healthcare 
+> infrastructure, and fewer resources to weather the winter 
+> amplification that consistently followed. Seasonality was 
+> equal. Its consequences were not.
+
+# 9. Outlier County Detection
+
+```{r funnel_plot, fig.cap="Funnel plot: county death rate vs population size"}
+library(plotly)
+
+# ============================================================
+# Recalculate funnel limits and county flags
+# ============================================================
+overall_rate <- sum(county_totals$total_deceased, na.rm = TRUE) /
+                sum(county_totals$total_pop,      na.rm = TRUE)
+
+pop_range <- seq(
+  min(county_totals$total_pop, na.rm = TRUE),
+  max(county_totals$total_pop, na.rm = TRUE),
+  length.out = 500
+)
+
+funnel_limits <- tibble(
+  total_pop = pop_range,
+  se        = sqrt(overall_rate * (1 - overall_rate) / pop_range),
+  ucl_95    = (overall_rate + 1.96 * se) * 100000,
+  lcl_95    = (overall_rate - 1.96 * se) * 100000,
+  ucl_998   = (overall_rate + 3.09 * se) * 100000,
+  lcl_998   = (overall_rate - 3.09 * se) * 100000
+)
+
+county_totals <- county_totals %>%
+  mutate(
+    se_county    = sqrt(overall_rate * (1 - overall_rate) / total_pop),
+    ucl_998      = (overall_rate + 3.09 * se_county) * 100000,
+    lcl_998      = (overall_rate - 3.09 * se_county) * 100000,
+    funnel_flag  = case_when(
+      cum_death_rate > ucl_998 ~ "Above 99.8% limit",
+      cum_death_rate < lcl_998 ~ "Below 99.8% limit",
+      TRUE                     ~ "Within limits"
+    ),
+    expected_rate = overall_rate * 100000,
+    excess_deaths = round(
+      (cum_death_rate - overall_rate * 100000) / 100000 * total_pop, 0
+    ),
+
+    # Full tooltip for every county
+    tooltip_text = paste0(
+      "<b>", county_name, ", ", state_name, "</b><br>",
+      "────────────────────────<br>",
+      "<b>Funnel Status: ", funnel_flag, "</b><br>",
+      "────────────────────────<br>",
+      "Cumulative Death Rate: ",
+      round(cum_death_rate, 1), " per 100k<br>",
+      "National Expected Rate: ",
+      round(overall_rate * 100000, 1), " per 100k<br>",
+      "Difference from Expected: ",
+      round(cum_death_rate - overall_rate * 100000, 1),
+      " per 100k<br>",
+      "Estimated Excess Deaths: ",
+      scales::comma(abs(excess_deaths)),
+      if_else(excess_deaths >= 0,
+              " above expected<br>",
+              " below expected<br>"),
+      "────────────────────────<br>",
+      "Population: ", scales::comma(total_pop), "<br>",
+      "% Age 65+: ",
+      scales::percent(pct_65_over,  accuracy = 0.1), "<br>",
+      "% Black: ",
+      scales::percent(pct_black,    accuracy = 0.1), "<br>",
+      "Poverty Rate: ",
+      scales::percent(poverty_rate, accuracy = 0.1), "<br>",
+      "% Without HS Diploma: ",
+      scales::percent(pct_less_than_hs, accuracy = 0.1), "<br>",
+      "────────────────────────<br>",
+      "<i>Upper 99.8% limit at this population: ",
+      round(ucl_998, 1), " per 100k</i>"
+    )
+  )
+
+# ============================================================
+# Build base ggplot
+# ============================================================
+p_funnel <- ggplot() +
+
+  # Control limit ribbons
+  geom_ribbon(data = funnel_limits,
+              aes(x = total_pop,
+                  ymin = lcl_998, ymax = ucl_998),
+              fill = "#457B9D", alpha = 0.12,
+              inherit.aes = FALSE) +
+  geom_ribbon(data = funnel_limits,
+              aes(x = total_pop,
+                  ymin = lcl_95, ymax = ucl_95),
+              fill = "#457B9D", alpha = 0.20,
+              inherit.aes = FALSE) +
+
+  # National mean reference line
+  geom_hline(
+    yintercept = overall_rate * 100000,
+    linetype   = "dashed",
+    color      = "grey40",
+    linewidth  = 0.7
+  ) +
+
+  # County points with tooltip
+  geom_point(
+    data = county_totals,
+    aes(x    = total_pop,
+        y    = cum_death_rate,
+        color = funnel_flag,
+        text  = tooltip_text),
+    alpha = 0.6,
+    size  = 1.8
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Above 99.8% limit" = "#E63946",
+      "Below 99.8% limit" = "#2A9D8F",
+      "Within limits"     = "grey60"
+    ),
+    name = NULL
+  ) +
+  scale_x_log10(labels = comma) +
+  scale_y_continuous(labels = comma) +
+
+  labs(
+    title    = "Funnel Plot: County COVID-19 Death Rate vs. Population",
+    subtitle = paste0(
+      "Hover any county for demographic profile | ",
+      "Red = statistically anomalous high burden | ",
+      "Teal = anomalous low burden"
+    ),
+    x       = "County Population (log scale)",
+    y       = "Cumulative Deaths per 100k",
+    caption = paste0(
+      "Shaded bands = 95% and 99.8% control limits | ",
+      "Dashed line = national mean (",
+      round(overall_rate * 100000, 1), " per 100k) | ",
+      "Counties outside 99.8% band are statistically ",
+      "anomalous for their population size"
+    )
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+# ============================================================
+# Convert to interactive plotly
+# ============================================================
+ggplotly(p_funnel, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(
+      bgcolor     = "white",
+      font        = list(size = 11),
+      bordercolor = "grey40",
+      align       = "left"
+    ),
+    legend = list(orientation = "h", y = -0.15)
+  )
+```
+
+
+
+# 10. Wave-Stratified Analysis
+
+```{r wave_death_rates, fig.cap="County death rate distribution by pandemic wave"}
+# Clean wave labels for non-technical audience
+wave_labels <- c(
+  "1_initial"    = "Wave 1: Initial Outbreak\n(Mar-Jun 2020)",
+  "2_summer2020" = "Wave 2: Summer 2020\n(Jul-Sep 2020)",
+  "3_winter2021" = "Wave 3: Winter Surge\n(Oct 2020-Feb 2021)",
+  "4_alpha"      = "Wave 4: Alpha Variant\n(Mar-Jun 2021)",
+  "5_delta"      = "Wave 5: Delta Variant\n(Jul-Nov 2021)",
+  "6_omicron"    = "Wave 6: Omicron\n(Dec 2021-Mar 2022)",
+  "7_endemic"    = "Wave 7: Endemic Phase\n(Apr-Sep 2022)"
+)
+
+# Calculate wave medians for annotation
+wave_medians <- county_weekly %>%
+  filter(pandemic_wave != "pre_pandemic") %>%
+  group_by(fips, pandemic_wave, total_pop) %>%
+  summarise(
+    wave_death_rate = (sum(new_deceased_wk, na.rm = TRUE) /
+                       first(total_pop)) * 100000,
+    .groups = "drop"
+  ) %>%
+  filter(wave_death_rate >= 0) %>%
+  group_by(pandemic_wave) %>%
+  summarise(
+    median_dr = median(wave_death_rate, na.rm = TRUE),
+    p75_dr    = quantile(wave_death_rate, 0.75, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+county_weekly %>%
+  filter(pandemic_wave != "pre_pandemic") %>%
+  group_by(fips, county_name, state_name,
+           pandemic_wave, total_pop) %>%
+  summarise(
+    wave_death_rate = (sum(new_deceased_wk, na.rm = TRUE) /
+                       first(total_pop)) * 100000,
+    .groups = "drop"
+  ) %>%
+  filter(wave_death_rate >= 0) %>%
+  # Trim to 95th percentile to remove extreme outliers
+  # that compress the meaningful distribution
+  filter(wave_death_rate <=
+           quantile(wave_death_rate, 0.95, na.rm = TRUE)) %>%
+  mutate(
+    pandemic_wave = factor(
+      pandemic_wave,
+      levels  = names(wave_labels),
+      labels  = wave_labels
+    )
+  ) %>%
+  ggplot(aes(x    = wave_death_rate,
+             y    = pandemic_wave,
+             fill = pandemic_wave)) +
+  ggridges::geom_density_ridges(
+    alpha          = 0.8,
+    scale          = 1.4,
+    quantile_lines = TRUE,
+    quantiles      = 2,          # median line
+    linewidth      = 0.6
+  ) +
+  scale_fill_manual(
+  values = c(
+    "Wave 1: Initial Outbreak\n(Mar-Jun 2020)"       = "#E63946",
+    "Wave 2: Summer 2020\n(Jul-Sep 2020)"            = "#F4A261",
+    "Wave 3: Winter Surge\n(Oct 2020-Feb 2021)"      = "#457B9D",
+    "Wave 4: Alpha Variant\n(Mar-Jun 2021)"          = "#2A9D8F",
+    "Wave 5: Delta Variant\n(Jul-Nov 2021)"          = "#E76F51",
+    "Wave 6: Omicron\n(Dec 2021-Mar 2022)"           = "#6A0572",
+    "Wave 7: Endemic Phase\n(Apr-Sep 2022)"          = "#A8DADC"
+  )
+) + 
+  scale_x_continuous(
+    labels = comma,
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  # Median value labels on each ridge
+  geom_text(
+    data = wave_medians %>%
+      mutate(
+        pandemic_wave = factor(
+          pandemic_wave,
+          levels = names(wave_labels),
+          labels = wave_labels
+        )
+      ),
+    aes(x     = median_dr + 4,
+        y     = pandemic_wave,
+        label = paste0("Median: ",
+                       round(median_dr, 1))),
+    inherit.aes = FALSE,
+    hjust       = 0,
+    vjust       = -0.8,
+    size        = 3.0,
+    color       = "grey30",
+    fontface    = "bold"
+  ) +
+  labs(
+    title    = "County Death Rate Distribution by Pandemic Wave",
+    subtitle = paste0(
+      "Each ridge = distribution of county death rates during that wave | ",
+      "Vertical line = median | ",
+      "Trimmed at 95th percentile for readability"
+    ),
+    x       = "Deaths per 100k during wave period",
+    y       = NULL,
+    caption = paste0(
+      "Wave periods defined by dominant variant circulation | ",
+      "Extreme outlier counties (top 5%) excluded from display | ",
+      "All counties included in statistical analysis"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position  = "none",
+    axis.text.y      = element_text(size = 9, hjust = 1),
+    plot.caption     = element_text(size = 8, color = "grey50"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+# 11. Next Steps & Data Gaps
+
+## Data Limitations & Coverage Assessment
+
+**Coverage Gap: covid19_open_data Pipeline**
+
+Six states have zero county-level coverage in the Google 
+covid19_open_data pipeline: Arkansas, Alabama, Colorado, 
+California, Arizona, and Connecticut (287 counties total). 
+An additional 28 states have partial coverage with Texas 
+missing 50 of 254 counties and several Great Plains states 
+missing 30-40% of counties.
+
+Demographic comparison of included vs missing counties reveals 
+the coverage gap is less directionally biased than initially 
+characterized. Missing counties (n=285) have substantially 
+smaller populations (median 2,860 vs 30,463), lower Black 
+population shares (2.5% vs 9.1%), lower poverty rates 
+(13.1% vs 15.5%), and higher elderly population shares 
+(23.0% vs 18.4%) than included counties. This profile is 
+consistent with small rural counties in the Great Plains and 
+Mountain West rather than the high-poverty majority minority 
+communities driving the core structural inequity findings.
+
+The Deep South concentration finding is therefore unlikely 
+to be materially biased by the coverage gap. The primary 
+residual concern is Alabama's complete absence -- a state 
+with significant Black Belt geography that almost certainly 
+contains counties meeting the persistently high burden 
+criteria. Core findings are assessed as robust to the current 
+data gap but complete national coverage remains a Phase 2 
+priority.
+
+**Time Series Gap: September 2022 to May 2023**
+
+The covid19_open_data pipeline stopped updating in September 
+2022. The US Public Health Emergency did not officially end 
+until May 11, 2023. The full Omicron tail and the transition 
+to endemic surveillance are not captured in the current 
+analysis period.
+
+
+
+## Phase 2 Data Integration Plan
+
+**Priority 1 — Complete National Coverage**
+USAFacts confirmed cases and deaths data covers all 3,143 US 
+counties and will fill the state-level pipeline gaps after 
+resolving the wide-format date unpivoting challenge documented 
+in the original ETL. CDC Wonder mortality data provides an 
+alternative complete-coverage source joinable on FIPS. Either 
+source will extend the analysis to full national coverage and 
+remove the systematic geographic bias documented above.
+
+**Priority 2 — CDC PLACES Comorbidity Data**
+County-level crude prevalence for diabetes, obesity, COPD, 
+coronary heart disease, hypertension, and smoking. Joins on 
+FIPS. Will replace the ACS disability proxy removed from the 
+ETL and give the regression model proper clinical comorbidity 
+covariates — the single most important analytical gap in the 
+current model specification.
+
+**Priority 3 — CDC Vaccination Rate by County**
+County-level vaccination coverage data joins on FIPS and will 
+allow the regression model to formally partition variant 
+severity from vaccination protection effects during the Delta 
+wave. This directly addresses the H1 hypothesis limitation 
+noted in Section 3b — the vaccination covariate needed to 
+formally test whether uptake differences explain the Wave 1 
+to Delta burden reorganization.
+
+**Priority 4 — CMS Medicaid and Medicare Integration**
+The persistently high burden counties identified in H3 map 
+closely onto regions of historically elevated Medicaid 
+enrollment and constrained healthcare infrastructure. CMS 
+publishes county-level Medicaid enrollment and per-capita 
+spending data joinable on FIPS. Formal testing of whether 
+healthcare access predicted persistent burden independent of 
+demographic covariates is the most direct policy-actionable 
+extension of the current findings.
+
+**Priority 5 — HRSA Health Professional Shortage Areas**
+County-level federal designations of medically underserved 
+areas join on FIPS and will test whether the persistently 
+high burden counties were already identified as healthcare 
+access deserts before the pandemic arrived. The expected 
+overlap between HRSA shortage designations and the 157 
+persistently high burden counties is a direct measure of 
+the degree to which COVID mortality was predictable from 
+pre-existing structural conditions.
+
+**Priority 6 — Native American Community Analysis**
+McKinley County New Mexico (majority Navajo Nation) appears 
+in the top 30 extreme mortality counties with a death rate 
+of 813.1 per 100k despite an elderly population of just 
+11.9%. Indian Health Service coverage data and tribal census 
+demographics are available at the county and tribal level 
+and would allow formal comparison of Native American 
+community outcomes against the Deep South Black Belt and 
+Appalachian poverty patterns identified in this analysis. 
+All three represent distinct histories of structural federal 
+neglect with convergent pandemic outcomes.
+
+
+
+## Phase 2 Modeling Extensions
+
+**Mixed-Effects Model**
+The current negative binomial model treats counties as 
+independent observations. A mixed-effects extension using 
+lme4::glmer.nb with state-level random effects would account 
+for the fact that counties within the same state share policy 
+environments, reporting standards, and healthcare 
+infrastructure. This is particularly important given the 
+strong state-level clustering visible in the persistently 
+high burden county geographic distribution.
+
+**Time-Varying Covariate Model**
+The current model uses static ACS demographic covariates. 
+A panel model incorporating time-varying vaccination rates, 
+mobility indices, and variant-specific wave indicators would 
+allow formal testing of whether structural disadvantage 
+interacted with pandemic phase to produce the wave 
+persistence pattern documented in H3.
+
+**Facility-Level Outlier Analysis**
+aggregation_level = 3 in covid19_open_data contains 
+sub-county localities including nursing homes and care 
+facilities in some states. Facility-level analysis would 
+identify whether specific institutions drove county-level 
+outlier status — particularly relevant for the extreme 
+mortality counties where a single nursing home outbreak 
+in a small population could produce catastrophic rates.
+
+
+
+## Phase 2 Visualization Plan
+
+**Interactive National Choropleth (Leaflet)**
+The current static choropleth will be rebuilt in Phase 2 
+using leaflet with complete national coverage. The 
+interactive version will include state boundary overlays, 
+county-level demographic tooltips, a state filter dropdown 
+for targeted analysis, and wave-specific views allowing 
+the geographic reorganization documented in H3 to be 
+explored visually at the county level.
+
+**Persistently High Burden County Profile Cards**
+The 157 persistently high burden counties currently 
+represented in the interactive leaflet map will be 
+supplemented with Phase 2 data to include Medicaid 
+enrollment rates, HRSA shortage designations, CDC PLACES 
+chronic disease prevalence, and vaccination coverage. 
+Each county's tooltip will become a complete structural 
+vulnerability profile.
+
+
+
+*Document generated: `r Sys.Date()`*
+*Data: Google COVID-19 Open Data + US Census ACS 2019 5-Year*
+*Analysis period: March 2020 -- September 2022*
+*Counties analyzed: 2,904 of approximately 3,143 US counties (92%)*
+*Phase 2 data integration in progress*
+
+
+*Document generated: `r Sys.Date()`*  
+*Data: Google COVID-19 Open Data + US Census ACS 2019 5-Year*  
+*Analysis period: March 2020 - September 2022*
