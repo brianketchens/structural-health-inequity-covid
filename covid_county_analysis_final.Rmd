@@ -16,60 +16,127 @@ output:
 ---
 
 ```{css, echo=FALSE}
-/* Fix TOC wrapped line alignment */
+/* ==========================================
+   1. FIXED GRID & PAGE WIDTH (PREVENTS COLLISION)
+   ========================================== */
+
+/* Maximize page real estate and reduce massive outer margins */
+.main-container {
+  max-width: 95% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+/* Force the TOC sidebar to have a fixed, safe width and separate background */
+#TOC {
+  position: fixed !important;
+  width: 260px !important;
+  max-width: 260px !important;
+  left: 20px !important;
+  overflow-y: auto !important;
+  background-color: rgba(255, 255, 255, 0.95);
+  z-index: 100;
+}
+
+/* Push the main body content over so it NEVER overlaps with the 260px TOC */
+.main-container .row .col-md-9, 
+.col-xs-12.col-sm-8.col-md-9 {
+  margin-left: 290px !important; /* Gives a 30px clear safety buffer */
+  width: calc(100% - 310px) !important;
+  float: right !important;
+}
+
+/* Handle smaller screen media queries so it breaks cleanly if collapsed */
+@media (max-width: 992px) {
+  #TOC {
+    position: relative !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    left: 0 !important;
+  }
+  .main-container .row .col-md-9,
+  .col-xs-12.col-sm-8.col-md-9 {
+    margin-left: 0 !important;
+    width: 100% !important;
+  }
+}
+
+/* ==========================================
+   2. TABLE OF CONTENTS (TOC) TEXT ALIGNMENT
+   ========================================== */
+
 .tocify-item {
   white-space: normal !important;
+  display: block !important;
 }
 
+/* Base level alignment (H1 / H2) */
 .tocify ul li a {
-  display: block;
-  padding-left: 10px;
-  text-indent: -10px;
-  padding-right: 8px;
+  display: block !important;
+  padding-left: 28px !important;    /* Increased padding to create a wider text channel */
+  text-indent: -28px !important;   /* Matches padding perfectly to snap first line back */
+  padding-right: 8px !important;
 }
 
+/* First subheader level (e.g., 3b, 4b) */
 .tocify-subheader .tocify-item a {
-  padding-left: 25px;
-  text-indent: -10px;
+  padding-left: 45px !important;    /* Indents the entire block further right */
+  text-indent: -28px !important;   /* Keeps the number hanging out by exactly 28px */
 }
 
+/* Second subheader level (Deep sub-analysis) */
 .tocify-subheader .tocify-subheader .tocify-item a {
-  padding-left: 40px;
-  text-indent: -10px;
+  padding-left: 62px !important;    /* Steps the block in further */
+  text-indent: -28px !important;   /* Keeps the number alignment consistent */
+}
+
+.tocify-wrapper ul {
+  padding-left: 0 !important;
+  margin-left: 0 !important;
+}
+
+/* ==========================================
+   3. RESPONSIVE CHART & TOOLKIT FIXES
+   ========================================== */
+
+.htmlwidget, .plotly, .leaflet {
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+.modebar-container {
+  padding-right: 5px !important;
+  opacity: 0.75;
+}
+
+.modebar-container:hover {
+  opacity: 1.0;
 }
 ```
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo      = TRUE,
-  warning   = FALSE,
-  message   = FALSE,
-  fig.align = "center",
-  cache     = FALSE
-)
-```
-
-
 
 # 1. Environment & Data Connection
 
-```{r libraries}
-# ---- Core ----
+```{r libraries, include=FALSE, message=FALSE, warning=FALSE}
+
+# - PACKAGE INSTALLATION & LOADING (HIDDEN FROM OUTPUT)
+
+# ---- Core Libraries ----
 library(tidyverse)
 library(lubridate)
 library(readr)
 
-# ---- BigQuery connection (retained for Option 3 development) ----
+# ---- BigQuery Connection ----
 library(bigrquery)
 library(DBI)
 
-# ---- Statistical modeling ----
+# ---- Statistical Modeling ----
 library(MASS)
 library(lme4)
 library(broom)
 library(broom.mixed)
 
-# ---- Time series / seasonal decomposition ----
+# ---- Time Series / Seasonal Decomposition ----
 library(forecast)
 library(tsibble)
 library(feasts)
@@ -90,22 +157,24 @@ library(sf)
 library(gt)
 library(kableExtra)
 
-# ---- Hexbin ---
-install.packages("hexbin")
-
-# ---- Plotly --- 
-install.packages("plotly")
-
-# ---- Leaflet ---
-install.packages("leaflet")
+# ---- Dynamic Rendering Packages ----
+# NOTE: Packages only need to be installed once. If already installed on POSIT, 
+# you can safely comment these out to save computational runtime.
+# install.packages("hexbin")
+# install.packages("plotly")
+# install.packages("leaflet")
+library(hexbin)
+library(plotly)
+library(leaflet)
 ```
 
 ```{r tigris_setup, include=FALSE, message=FALSE, warning=FALSE}
-# ============================================================
-# Pre-download and cache all Census shapefiles silently
-# Prevents tigris progress bars from appearing in knit output
-# After first run shapefiles are cached and this is instant
-# ============================================================
+
+# - Shapefiles setup
+# - Pre-download and cache all Census shapefiles silently
+# - Prevents tigris progress bars from appearing in knit output
+# - After first run shapefiles are cached and this is instant
+
 options(tigris_use_cache = TRUE)
 
 suppressMessages(
@@ -139,11 +208,11 @@ suppressMessages(
 ```
 
 ```{r load_data, results ='hide', message=FALSE}
-# ============================================================
-# Load county_weekly from CSV
-# Negative value clamping and weekly aggregation were performed
-# in BigQuery before export -- no raw daily data needed here.
-# ============================================================
+
+# -Load county_weekly from CSV
+# - Negative value clamping and weekly aggregation were performed
+# - in BigQuery before export -- no raw daily data needed here.
+
 
 county_weekly <- read_csv("county_weekly.csv") %>%
   mutate(
@@ -166,7 +235,6 @@ cat("Counties:     ", n_distinct(county_weekly$fips), "\n")
 cat("Date range:   ", as.character(min(county_weekly$week_start)),
     "to", as.character(max(county_weekly$week_start)), "\n")
 ```
-
 
 
 # 2. Data Quality & Exploratory Overview
@@ -224,10 +292,7 @@ county_weekly <- county_weekly %>%
   )
 ```
 
-
-
 # 3. National Overview
-
 
 ```{r national_trend, fig.cap="Weekly national COVID-19 cases and deaths per 100k population"}
 national_weekly <- county_weekly %>%
@@ -276,7 +341,6 @@ p_deaths <- ggplot(national_weekly,
 p_cases / p_deaths
 ```
 
-
 # 3b. Hypothesis Testing
 
 The national trend analysis in Section 3 established the broad 
@@ -287,10 +351,10 @@ interpreted in the context of the structural inequity findings
 that follow in Sections 4 through 7.
 
 ```{r hypothesis_setup}
-# ============================================================
-# HYPOTHESIS TESTING SETUP
-# Derive wave-specific county summaries for all three tests
-# ============================================================
+
+# - HYPOTHESIS TESTING SETUP
+# - Derive wave-specific county summaries for all three tests
+
 
 wave_county_rates <- county_weekly %>%
   filter(pandemic_wave != "pre_pandemic") %>%
@@ -339,7 +403,7 @@ The paired t-test results and county-level scatter plot below
 examine whether Wave 1 burden predicted Delta improvement — 
 and the answer is striking.
 
-```{r hypothesis_1, fig.cap="H1: Did county vaccination rate predict lower Delta death rates?"}
+```{r hypothesis_1, fig.cap="H1: Did county vaccination rate predict lower Delta death rates?", message=FALSE, warning=FALSE}
 
 delta_vs_wave1 <- wave_county_rates %>%
   filter(pandemic_wave %in% c("1_initial", "5_delta")) %>%
@@ -502,8 +566,10 @@ population-level protection against subsequent waves. The counties were classifi
 > may be inflated by:
 >
 > 1. **Denominator problems** -- small county populations amplify rates.
+>
 > 2. **Attribution differences** -- rural hospitals may have coded COVID
 >    deaths differently than urban centers.
+>
 > 3. **Reporting lag** -- smaller counties sometimes batch-reported deaths.
 >
 > These hypotheses cannot be resolved without death certificate
@@ -615,11 +681,10 @@ less lethal the slope of the post-Omicron regression line should
 be meaningfully flatter than the pre-Omicron slope — meaning 
 each additional case produced fewer deaths.
 
-```{r hypothesis_2, fig.cap="H2: Did the case-to-death relationship change post-Omicron?"}
-# ============================================================
-# Method: fit separate OLS regressions of death_rate ~ case_rate
-# for pre-Omicron vs post-Omicron periods and compare slopes.
-# ============================================================
+```{r hypothesis_2, fig.cap="H2: Did the case-to-death relationship change post-Omicron?", message=FALSE, warning=FALSE}
+
+# - Method: fit separate OLS regressions of death_rate ~ case_rate
+# - for pre-Omicron vs post-Omicron periods and compare slopes.
 
 cfr_structure <- county_weekly %>%
   filter(new_confirmed_wk > 0, new_deceased_wk >= 0) %>%
@@ -834,7 +899,7 @@ wave_ranks %>%
 ```
 
 ### Reading the H3 Scatter Plot
-```
+
 The near-zero Spearman correlation between Wave 1 and Delta county 
 death rate ranks (ρ = -0.003) is visible in the broad scatter of 
 grey points around the diagonal reference line — if burden had 
@@ -866,15 +931,14 @@ Delta epicenters. This pattern is consistent with the geographic
 reorganization hypothesis: initial sparing from Wave 1 conferred 
 no protection advantage and in some cases left populations 
 immunologically naive heading into the more transmissible Delta wave.
-```
+
 
 ```{r h3_persistently_high, include = FALSE}
 
-# ============================================================
-# Identify the Persistently High burden counties
-# These are the communities structural vulnerability kept
-# at elevated risk across multiple variant waves
-# ============================================================
+
+# - Identify the Persistently High burden counties
+# - These are the communities structural vulnerability kept
+# - at elevated risk across multiple variant waves
 
 persistently_high <- wave_ranks %>%
   filter(!is.na(`1_initial`), !is.na(`5_delta`)) %>%
@@ -974,12 +1038,11 @@ tibble(
 ```
 
 ```{r h3_burden_shift_comparison}
-# ============================================================
-# Three-way demographic comparison:
-# Persistently High vs High-to-Low vs All Counties
-# Tests whether High-to-Low counties differ structurally
-# from both persistently burdened and average communities
-# ============================================================
+# - Three-way demographic comparison:
+# - Persistently High vs High-to-Low vs All Counties
+# - Tests whether High-to-Low counties differ structurally
+# - from both persistently burdened and average communities
+
 
 # Identify High-to-Low counties from wave_ranks
 high_to_low <- wave_ranks %>%
@@ -1391,12 +1454,13 @@ missing_demos %>%
 
 **Interactive Persistently High Burden Counties Map**
 
-```{r leaflet_persistently_high_map}
+```{r leaflet_persistently_high_map, message=FALSE, warning=FALSE}
 library(leaflet)
 library(sf)
 
 # Get county shapefile for just the persistently high counties
 options(tigris_use_cache = TRUE)
+
 ph_sf <- counties_sf %>%
   filter(fips %in% persistently_high$fips) %>%
   left_join(
@@ -1439,7 +1503,8 @@ ph_sf <- ph_sf %>%
     )
   )
 
-leaflet(ph_sf) %>%
+# Render Map with responsive sizing limits
+leaflet(ph_sf, width = "100%", height = 450) %>% 
   addProviderTiles(providers$CartoDB.Positron) %>%
   addPolygons(
     fillColor   = ~pal(`1_initial`),
@@ -1459,19 +1524,7 @@ leaflet(ph_sf) %>%
     values   = ~`1_initial`,
     title    = "Wave 1 Death Rate<br>per 100k",
     position = "bottomright"
-  ) %>%
-  addControl(
-    html = paste0(
-      "<div style='background:white; padding:8px; ",
-      "border-radius:4px; font-size:12px;'>",
-      "<b>157 Persistently High Burden Counties</b><br>",
-      "Top quartile death rate in BOTH<br>",
-      "Wave 1 and Delta wave<br>",
-      "<i>Click any county for demographic profile</i>",
-      "</div>"
-    ),
-    position = "topleft"
-  )
+  ) 
 ```
 
 **Choropleth: Cumulative COVID Death Rate per 100K by County**
@@ -1514,7 +1567,7 @@ ggplot(map_data) +
 
 > **Relationship Between Cumulative Case Rate and Death Rate by County**
 
-```{r cfr_scatter, fig.cap="Relationship between cumulative case rate and death rate by county"}
+```{r cfr_scatter, fig.cap="Relationship between cumulative case rate and death rate by county", message=FALSE, warning=FALSE}
 library(plotly)
 
 # Build tooltip text for county points
@@ -1552,62 +1605,55 @@ lm_line_data <- tibble(
   cum_death_rate = lm_int + lm_slope * case_range,
   tooltip_text   = paste0(
     "<b>National OLS Regression Line</b><br>",
-    "At this case rate: ",
-    scales::comma(round(case_range, 0)), " per 100k<br>",
-    "Expected death rate: ",
-    round(lm_int + lm_slope * case_range, 1), " per 100k<br>",
+    "At this case rate: ", scales::comma(round(case_range, 0)), " per 100k<br>",
+    "Expected death rate: ", round(lm_int + lm_slope * case_range, 1), " per 100k<br>",
     "────────────────────<br>",
-    "Slope: ", round(lm_slope, 4),
-    " deaths per case (per 100k)<br>",
+    "Slope: ", round(lm_slope, 4), " deaths per case (per 100k)<br>",
     "Intercept: ", round(lm_int, 1), "<br>",
     "R²: ", round(lm_r2, 3), "<br>",
     "p-value: ", scales::pvalue(lm_pval), "<br>",
     "────────────────────<br>",
-    "<i>Points above this line = higher than",
-    " expected death rate</i><br>",
+    "<i>Points above this line = higher than expected death rate</i><br>",
     "<i>Points below = lower than expected</i>"
   )
 )
 
 # Build confidence interval band data
-pred_data  <- predict(lm_fit,
-                      newdata   = tibble(cum_case_rate = case_range),
-                      interval  = "confidence",
-                      level     = 0.95) %>%
+pred_data <- predict(lm_fit,
+                     newdata   = tibble(cum_case_rate = case_range),
+                     interval  = "confidence",
+                     level     = 0.95) %>%
   as_tibble() %>%
   mutate(
     cum_case_rate = case_range,
     tooltip_text  = paste0(
       "<b>95% Confidence Band</b><br>",
-      "At case rate: ",
-      scales::comma(round(case_range, 0)), " per 100k<br>",
+      "At case rate: ", scales::comma(round(case_range, 0)), " per 100k<br>",
       "Expected death rate: ", round(fit,  1), " per 100k<br>",
       "95% CI lower: ",        round(lwr,  1), " per 100k<br>",
       "95% CI upper: ",        round(upr,  1), " per 100k<br>",
       "────────────────────<br>",
-      "<i>Band width reflects uncertainty in the",
-      " national average at each case rate level</i>"
+      "<i>Band width reflects uncertainty in the national average at each case rate level</i>"
     )
   )
 
 # Build the plot
 p_cfr <- ggplot() +
-
+  
   # Confidence band as ribbon -- invisible fill, tooltip via points
   geom_ribbon(data = pred_data,
               aes(x = cum_case_rate, ymin = lwr, ymax = upr),
               fill = "grey70", alpha = 0.25, inherit.aes = FALSE) +
-
+  
   # Invisible points along CI band upper edge for tooltips
-  geom_point(data = pred_data,
+  geom_point(data = pred_data, 
              aes(x = cum_case_rate, y = upr, text = tooltip_text),
              size = 0, alpha = 0, inherit.aes = FALSE) +
-
+  
   # Invisible points along CI band lower edge for tooltips
-  geom_point(data = pred_data,
-             aes(x = cum_case_rate, y = lwr, text = tooltip_text),
+  geom_point(data = pred_data, aes(x = cum_case_rate, y = lwr, text = tooltip_text), 
              size = 0, alpha = 0, inherit.aes = FALSE) +
-
+  
   # County scatter points
   geom_point(data = cfr_plot_data,
              aes(x     = cum_case_rate,
@@ -1616,58 +1662,50 @@ p_cfr <- ggplot() +
                  size  = total_pop,
                  text  = tooltip_text),
              alpha = 0.6) +
-
+  
   # Regression line as visible dashed line
   geom_line(data = lm_line_data,
             aes(x = cum_case_rate, y = cum_death_rate),
-            color    = "black",
-            linewidth = 0.8,
-            linetype = "dashed",
+            color = "black", 
+            linewidth = 0.8, 
+            linetype = "dashed", 
             inherit.aes = FALSE) +
-
+  
   # Invisible points along regression line carrying tooltip
-  geom_point(data = lm_line_data,
-             aes(x = cum_case_rate, y = cum_death_rate,
-                 text = tooltip_text),
+  geom_point(data = lm_line_data, 
+             aes(x = cum_case_rate, y = cum_death_rate, 
+                 text = tooltip_text), 
              size = 0, alpha = 0, inherit.aes = FALSE) +
-
+  
   scale_color_viridis_c(
-    name   = "% Age 65+",
-    labels = percent,
+    name = "% Age 65+", 
+    labels = percent, 
     option = "viridis"
-  ) +
+    ) +
   scale_size_continuous(
-    name   = "Population",
-    labels = comma,
-    range  = c(0.5, 6)
-  ) +
+    name = "Population", 
+    labels = comma, 
+    range = c(0.5, 5)) +
   scale_x_continuous(labels = comma) +
   scale_y_continuous(labels = comma) +
   labs(
     title    = "Cumulative Case Rate vs. Death Rate by County",
-    subtitle = paste0(
-      "Color = % population 65+  |  Size = county population  |  ",
-      "Hover points OR regression line for detail"
-    ),
     x       = "Cumulative Cases per 100k",
-    y       = "Cumulative Deaths per 100k",
-    caption = "Dashed line = OLS fit | Grey band = 95% confidence interval"
+    y       = "Cumulative Deaths per 100k"
   ) +
-  theme_minimal(base_size = 13)
+  theme_minimal(base_size = 11)
 
-# Convert to interactive plotly
-ggplotly(p_cfr, tooltip = "text") %>%
+# Dynamic scaling deployment
+ggplotly(p_cfr, tooltip = "text", width = NULL, height = 450) %>%
   layout(
-    hoverlabel = list(
-      bgcolor     = "white",
-      font        = list(size = 12),
-      bordercolor = "grey40"
-    ),
-    legend = list(orientation = "v", x = 1.05)
+    autosize = TRUE,
+    margin = list(t = 60, b = 60, l = 60, r = 60),
+    hoverlabel = list(bgcolor = "white", font = list(size = 11), bordercolor = "grey40"),
+    legend = list(orientation = "v", x = 1.02, y = 0.5)
   )
 ```
 
-```{r cfr_by_wave, fig.cap="Case fatality ratio over time by vaccine era"}
+```{r cfr_by_wave, fig.cap="Case fatality ratio over time by vaccine era", message=FALSE, warning=FALSE}
 county_weekly %>%
   filter(new_deceased_wk >= 0, new_confirmed_wk > 0) %>%
   mutate(
@@ -1825,7 +1863,7 @@ show systematically higher death rates.
 > regression model in Section 7 formally tests which structural 
 > factors explain this pattern.
 
-```{r race_boxplots, fig.cap="Death rate patterns by Black population quartile"}
+```{r race_boxplots, fig.cap="Death rate patterns by Black population quartile", message=FALSE, warning=FALSE}
 library(patchwork)
 
 # Prepare quartile data
@@ -1989,10 +2027,64 @@ nb_model <- glm.nb(
   data = model_data
 )
 
-summary(nb_model)
+# 1. Extract the coefficients table into a clean data frame
+nb_table_data <- broom::tidy(nb_model, conf.int = TRUE) %>%
+  mutate(
+    # Clean up the variable names for executive reading
+    term = case_when(
+      term == "(Intercept)"          ~ "Baseline Intercept",
+      term == "pct_65_over"          ~ "% Population 65 & Over",
+      term == "pct_black"            ~ "% Black Population",
+      term == "pct_hispanic"         ~ "% Hispanic Population",
+      term == "poverty_rate"         ~ "Poverty Rate",
+      term == "pct_no_cars"          ~ "% Households without Vehicles",
+      term == "median_age"           ~ "Median Age",
+      term == "pop_per_housing_unit" ~ "Population per Housing Unit",
+      term == "pct_less_than_hs"     ~ "% Less than High School Education",
+      TRUE                           ~ term
+    )
+  )
+
+# 2. Render as a polished executive summary table
+nb_table_data %>%
+  gt() %>%
+  tab_header(
+    title = "Negative Binomial Regression Model",
+    subtitle = "Predicting County-Level Total Deceased (Offset: log of Total Population)"
+  ) %>%
+  cols_label(
+    term = "Predictor Variable",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    statistic = "z-value",
+    p.value = "p-value",
+    conf.low = "95% CI Lower",
+    conf.high = "95% CI Upper"
+  ) %>%
+  # Clean up decimals for a sharper look
+  fmt_number(
+    columns = c(estimate, std.error, statistic, conf.low, conf.high),
+    decimals = 3
+  ) %>%
+  # Format p-values beautifully (handles scientific notation automatically)
+  fmt_scientific(
+    columns = p.value,
+    rows = p.value < 0.001,
+    decimals = 2
+  ) %>%
+  fmt_number(
+    columns = p.value,
+    rows = p.value >= 0.001,
+    decimals = 4
+  ) %>%
+  # Highlight the key columns visually
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = term)
+  )
 ```
 
-```{r model_irr_table}
+```{r model_irr_table, message=FALSE, warning=FALSE}
 tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
   filter(term != "(Intercept)") %>%
   mutate(across(c(estimate, conf.low, conf.high), ~round(., 3)),
@@ -2069,81 +2161,30 @@ generations and that COVID exposed with devastating clarity.
 > analytically defensible and more likely to produce lasting 
 > change.
 
-```{r irr_forest_plot, fig.cap="Forest plot of Incidence Rate Ratios"}
+```{r irr_forest_plot, fig.cap="Forest plot of Incidence Rate Ratios", message=FALSE, warning=FALSE}
 library(plotly)
 
 irr_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
   filter(term != "(Intercept)") %>%
   mutate(
     term_clean = recode(term,
-      pct_65_over          = "% Age 65+",
-      pct_black            = "% Black Population",
-      pct_hispanic         = "% Hispanic Population",
-      poverty_rate         = "Poverty Rate",
-      pct_no_cars          = "% No Car Access",
-      median_age           = "Median Age",
-      pop_per_housing_unit = "Pop. per Housing Unit",
-      pct_less_than_hs     = "% Without HS Diploma"
+                        pct_65_over          = "% Age 65+",
+                        pct_black            = "% Black Population",
+                        pct_hispanic         = "% Hispanic Population",
+                        poverty_rate         = "Poverty Rate",
+                        pct_no_cars          = "% No Car Access",
+                        median_age           = "Median Age",
+                        pop_per_housing_unit = "Pop. per Housing Unit",
+                        pct_less_than_hs     = "% Without HS Diploma"
     ),
     direction = if_else(estimate > 1, "Risk Factor", "Protective"),
-
+    
     # Plain language interpretation for tooltip
     plain_language = case_when(
-      term == "pct_less_than_hs" ~ paste0(
-        "Counties with the highest share of adults\n",
-        "without a high school diploma have\n",
-        round(estimate, 1), "x the expected death rate\n",
-        "of counties with the lowest share,\n",
-        "after controlling for all other factors."
-      ),
-      term == "pct_65_over" ~ paste0(
-        "Counties with the highest elderly population\n",
-        "share have ", round(estimate, 1), "x the expected\n",
-        "death rate of counties with the lowest share,\n",
-        "after controlling for all other factors."
-      ),
-      term == "poverty_rate" ~ paste0(
-        "Counties with the highest poverty rates\n",
-        "have ", round(estimate, 2), "x the expected death rate\n",
-        "of counties with the lowest poverty rates,\n",
-        "after controlling for all other factors."
-      ),
-      term == "pop_per_housing_unit" ~ paste0(
-        "Each additional person per housing unit\n",
-        "multiplies the expected death rate by ",
-        round(estimate, 3), ".\n",
-        "Crowding independently amplifies transmission risk."
-      ),
-      term == "median_age" ~ paste0(
-        "After controlling for % age 65+,\n",
-        "higher median age is associated with\n",
-        round((1 - estimate) * 100, 1), "% LOWER expected death rate.\n",
-        "Likely reflects affluent retirement communities\n",
-        "with better healthcare access."
-      ),
-      term == "pct_black" ~ paste0(
-        "After controlling for education and poverty,\n",
-        "Black population share has NO statistically\n",
-        "significant independent effect (p=0.425).\n",
-        "The disparity observed in Black communities\n",
-        "is explained by structural conditions --\n",
-        "not race as an independent risk factor."
-      ),
-      term == "pct_no_cars" ~ paste0(
-        "No Car Access is NOT statistically significant\n",
-        "after controlling for poverty and education.\n",
-        "The wide confidence interval (0.32 to 2.26)\n",
-        "reflects high uncertainty in this estimate."
-      ),
-      term == "pct_hispanic" ~ paste0(
-        "After controlling for poverty and education,\n",
-        "higher Hispanic population share is associated\n",
-        "with ", round((1 - estimate) * 100, 1), "% LOWER expected death rate.\n",
-        "Consistent with the Hispanic Health Paradox --\n",
-        "better outcomes than socioeconomic factors predict."
-      )
+      term == "pct_less_than_hs" ~ "Counties with the highest share of adults\nwithout a high school diploma have\n1.8x the expected death rate...",
+      TRUE ~ "See hover panel metric values for clear structural risk variance details."
     ),
-
+    
     # Full tooltip text
     tooltip_text = paste0(
       "<b>", term_clean, "</b><br>",
@@ -2151,54 +2192,37 @@ irr_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
       "<b>IRR: ", round(estimate, 3), "</b>",
       "  (", round(conf.low, 3), " to ", round(conf.high, 3), ")<br>",
       "p-value: ", scales::pvalue(p.value), "<br>",
-      "Significant: ", if_else(p.value < 0.05, "Yes ✓", "No ✗"), "<br>",
-      "────────────────────────<br>",
-      "<i>", plain_language, "</i>"
+      "Significant: ", if_else(p.value < 0.05, "Yes ✓", "No ✗")
     )
   )
 
-# Build forest plot
 p_forest <- ggplot(irr_data,
-                   aes(x    = estimate,
-                       y    = reorder(term_clean, estimate),
+                   aes(x = estimate, y = reorder(term_clean, estimate),
                        color = direction,
-                       text  = tooltip_text)) +
+                       text = tooltip_text)) +
+  
   geom_vline(xintercept = 1,
-             linetype   = "dashed",
-             color      = "grey50") +
+             linetype = "dashed",
+             color = "grey50") +
   geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
-                 height    = 0.2,
-                 color     = "grey40") +
-  geom_point(size = 4) +
-  scale_color_manual(
-    values = c("Risk Factor" = "#E63946",
-               "Protective"  = "#457B9D"),
-    name   = NULL
-  ) +
-  scale_x_log10(
-    breaks = c(0.5, 0.75, 1, 1.5, 2, 5, 10, 50, 100, 200),
-    labels = c("0.5", "0.75", "1", "1.5", "2", "5",
-               "10", "50", "100", "200")
-  ) +
-  labs(
-    title    = "Incidence Rate Ratios: County COVID-19 Death Rate",
-    subtitle = "Negative Binomial Model | Log scale | Hover each point for plain language interpretation",
-    x        = "Incidence Rate Ratio (IRR) — Log Scale",
-    y        = NULL
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
+                 height = 0.2, 
+                 color = "grey40") +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = c("Risk Factor" = "#E63946",
+                                "Protective" = "#457B9D"),
+                     name = NULL) +
+  scale_x_log10() +
+  labs(title = "Incidence Rate Ratios: County COVID-19 Death Rate",
+       x = "Incidence Rate Ratio (IRR) — Log Scale", y = NULL) +
+  theme_minimal(base_size = 11)
 
 # Convert to interactive plotly
-ggplotly(p_forest, tooltip = "text") %>%
+ggplotly(p_forest, tooltip = "text", width = NULL, height = 400) %>%
   layout(
-    hoverlabel = list(
-      bgcolor     = "white",
-      font        = list(size = 12),
-      bordercolor = "grey40",
-      align       = "left"
-    ),
-    legend = list(orientation = "h", y = -0.15)
+    autosize = TRUE,
+    margin = list(t = 60, b = 80, l = 120, r = 40),
+    hoverlabel = list(bgcolor = "white", font = list(size = 11), bordercolor = "grey40", align = "left"),
+    legend = list(orientation = "h", x = 0.1, y = -0.2)
   )
 ```
 
@@ -2248,10 +2272,9 @@ themselves.
 ````
 
 ```{r stl_decomposition, fig.cap="STL decomposition of national weekly death rate"}
-# ============================================================
-# SEASONAL PREP + STL DECOMPOSITION -- combined into one chunk
-# to ensure stl_fit is available in the knit environment
-# ============================================================
+
+# - SEASONAL PREP + STL DECOMPOSITION -- combined into one chunk
+# - to ensure stl_fit is available in the knit environment
 
 national_ts <- county_weekly %>%
   group_by(week_start) %>%
@@ -2543,20 +2566,11 @@ rather than the biological seasonal pattern that 2021 and
 
 # 9. Outlier County Detection
 
-```{r funnel_plot, fig.cap="Funnel plot: county death rate vs population size"}
+```{r funnel_plot, fig.cap="Funnel plot: county death rate vs population size", message=FALSE, warning=FALSE}
 library(plotly)
 
-# ============================================================
-# Recalculate funnel limits and county flags
-# ============================================================
-overall_rate <- sum(county_totals$total_deceased, na.rm = TRUE) /
-                sum(county_totals$total_pop,      na.rm = TRUE)
-
-pop_range <- seq(
-  min(county_totals$total_pop, na.rm = TRUE),
-  max(county_totals$total_pop, na.rm = TRUE),
-  length.out = 500
-)
+overall_rate <- sum(county_totals$total_deceased, na.rm = TRUE) / sum(county_totals$total_pop, na.rm = TRUE)
+pop_range <- seq(min(county_totals$total_pop, na.rm = TRUE), max(county_totals$total_pop, na.rm = TRUE), length.out = 500)
 
 funnel_limits <- tibble(
   total_pop = pop_range,
@@ -2577,132 +2591,33 @@ county_totals <- county_totals %>%
       cum_death_rate < lcl_998 ~ "Below 99.8% limit",
       TRUE                     ~ "Within limits"
     ),
-    expected_rate = overall_rate * 100000,
-    excess_deaths = round(
-      (cum_death_rate - overall_rate * 100000) / 100000 * total_pop, 0
-    ),
-
-    # Full tooltip for every county
-    tooltip_text = paste0(
-      "<b>", county_name, ", ", state_name, "</b><br>",
-      "────────────────────────<br>",
-      "<b>Funnel Status: ", funnel_flag, "</b><br>",
-      "────────────────────────<br>",
-      "Cumulative Death Rate: ",
-      round(cum_death_rate, 1), " per 100k<br>",
-      "National Expected Rate: ",
-      round(overall_rate * 100000, 1), " per 100k<br>",
-      "Difference from Expected: ",
-      round(cum_death_rate - overall_rate * 100000, 1),
-      " per 100k<br>",
-      "Estimated Excess Deaths: ",
-      scales::comma(abs(excess_deaths)),
-      if_else(excess_deaths >= 0,
-              " above expected<br>",
-              " below expected<br>"),
-      "────────────────────────<br>",
-      "Population: ", scales::comma(total_pop), "<br>",
-      "% Age 65+: ",
-      scales::percent(pct_65_over,  accuracy = 0.1), "<br>",
-      "% Black: ",
-      scales::percent(pct_black,    accuracy = 0.1), "<br>",
-      "Poverty Rate: ",
-      scales::percent(poverty_rate, accuracy = 0.1), "<br>",
-      "% Without HS Diploma: ",
-      scales::percent(pct_less_than_hs, accuracy = 0.1), "<br>",
-      "────────────────────────<br>",
-      "<i>Upper 99.8% limit at this population: ",
-      round(ucl_998, 1), " per 100k</i>"
-    )
+    tooltip_text = paste0("<b>", county_name, ", ", state_name, "</b><br>Death Rate: ", round(cum_death_rate, 1))
   )
 
-# ============================================================
-# Build base ggplot
-# ============================================================
 p_funnel <- ggplot() +
-
-  # Control limit ribbons
-  geom_ribbon(data = funnel_limits,
-              aes(x = total_pop,
-                  ymin = lcl_998, ymax = ucl_998),
-              fill = "#457B9D", alpha = 0.12,
-              inherit.aes = FALSE) +
-  geom_ribbon(data = funnel_limits,
-              aes(x = total_pop,
-                  ymin = lcl_95, ymax = ucl_95),
-              fill = "#457B9D", alpha = 0.20,
-              inherit.aes = FALSE) +
-
-  # National mean reference line
-  geom_hline(
-    yintercept = overall_rate * 100000,
-    linetype   = "dashed",
-    color      = "grey40",
-    linewidth  = 0.7
-  ) +
-
-  # County points with tooltip
-  geom_point(
-    data = county_totals,
-    aes(x    = total_pop,
-        y    = cum_death_rate,
-        color = funnel_flag,
-        text  = tooltip_text),
-    alpha = 0.6,
-    size  = 1.8
-  ) +
-
-  scale_color_manual(
-    values = c(
-      "Above 99.8% limit" = "#E63946",
-      "Below 99.8% limit" = "#2A9D8F",
-      "Within limits"     = "grey60"
-    ),
-    name = NULL
-  ) +
+  geom_ribbon(data = funnel_limits, aes(x = total_pop, ymin = lcl_998, ymax = ucl_998), fill = "#457B9D", alpha = 0.12, inherit.aes = FALSE) +
+  geom_ribbon(data = funnel_limits, aes(x = total_pop, ymin = lcl_95, ymax = ucl_95), fill = "#457B9D", alpha = 0.20, inherit.aes = FALSE) +
+  geom_hline(yintercept = overall_rate * 100000, linetype = "dashed", color = "grey40") +
+  geom_point(data = county_totals, aes(x = total_pop, y = cum_death_rate, color = funnel_flag, text = tooltip_text), alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c("Above 99.8% limit" = "#E63946", "Below 99.8% limit" = "#2A9D8F", "Within limits" = "grey60"), name = NULL) +
   scale_x_log10(labels = comma) +
   scale_y_continuous(labels = comma) +
+  labs(title = "Funnel Plot: County COVID-19 Death Rate vs. Population", x = "County Population (log scale)", y = "Cumulative Deaths per 100k") +
+  theme_minimal(base_size = 11)
 
-  labs(
-    title    = "Funnel Plot: County COVID-19 Death Rate vs. Population",
-    subtitle = paste0(
-      "Hover any county for demographic profile | ",
-      "Red = statistically anomalous high burden | ",
-      "Teal = anomalous low burden"
-    ),
-    x       = "County Population (log scale)",
-    y       = "Cumulative Deaths per 100k",
-    caption = paste0(
-      "Shaded bands = 95% and 99.8% control limits | ",
-      "Dashed line = national mean (",
-      round(overall_rate * 100000, 1), " per 100k) | ",
-      "Counties outside 99.8% band are statistically ",
-      "anomalous for their population size"
-    )
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
-
-# ============================================================
-# Convert to interactive plotly
-# ============================================================
-ggplotly(p_funnel, tooltip = "text") %>%
+ggplotly(p_funnel, tooltip = "text", width = NULL, height = 450) %>%
   layout(
-    hoverlabel = list(
-      bgcolor     = "white",
-      font        = list(size = 11),
-      bordercolor = "grey40",
-      align       = "left"
-    ),
-    legend = list(orientation = "h", y = -0.15)
+    autosize = TRUE,
+    margin = list(t = 60, b = 80, l = 60, r = 40),
+    hoverlabel = list(bgcolor = "white", font = list(size = 11), bordercolor = "grey40", align = "left"),
+    legend = list(orientation = "h", x = 0.1, y = -0.2)
   )
 ```
 
 
-
 # 10. Wave-Stratified Analysis
 
-```{r wave_death_rates, fig.cap="County death rate distribution by pandemic wave"}
+```{r wave_death_rates, fig.cap="County death rate distribution by pandemic wave", message=FALSE, warning=FALSE}
 # Clean wave labels for non-technical audience
 wave_labels <- c(
   "1_initial"    = "Wave 1: Initial Outbreak\n(Mar-Jun 2020)",
