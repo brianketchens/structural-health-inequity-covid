@@ -95,6 +95,9 @@ output:
   margin-left: 0 !important;
 }
 
+.tocify {
+  font-size: 12.5px;
+}
 /* ==========================================
    3. RESPONSIVE CHART & TOOLKIT FIXES
    ========================================== */
@@ -117,6 +120,19 @@ output:
 
 # 1. Environment & Data Connection
 
+```
+install.packages(c(
+  "tidyverse", "lubridate", "readr", "bigrquery", "DBI",
+  "MASS", "lme4", "broom", "broom.mixed",
+  "forecast", "tsibble", "feasts",
+  "scales", "ggrepel", "patchwork", "viridis", "RColorBrewer", "ggridges",
+  "gt", "kableExtra", "hexbin", "plotly"
+))
+```
+```
+install.packages(c("sf", "tigris", "leaflet"))
+```
+
 ```{r libraries, include=FALSE, message=FALSE, warning=FALSE}
 
 # - PACKAGE INSTALLATION & LOADING (HIDDEN FROM OUTPUT)
@@ -135,6 +151,7 @@ library(MASS)
 library(lme4)
 library(broom)
 library(broom.mixed)
+
 
 # ---- Time Series / Seasonal Decomposition ----
 library(forecast)
@@ -237,7 +254,7 @@ cat("Date range:   ", as.character(min(county_weekly$week_start)),
 ```
 
 
-# 2. Data Quality & Exploratory Overview
+# 2. Data Quality Overview
 
 ```{r data_quality}
 missing_summary <- county_weekly %>%
@@ -1237,7 +1254,7 @@ model in Section 7 formally identifies.
 > story about how structural disadvantage determined which 
 > communities paid the price for each successive wave.
 
-# 4. Excess Mortality -- Counties Above Expected Death Rate
+# 4. Excess Mortality by County
 
 ```{r county_totals}
 county_totals <- county_weekly %>%
@@ -1353,7 +1370,7 @@ overlap_check %>%
 > provides a clean lower boundary validating both classifications.
 
 
-# 4b. Persistently High -- Counties Above Expected Death Rate
+# 4b. Persistently High-Burden Counties
 
 > **Identify which states have complete, partial, or zero county coverage
 > in the dataset** 
@@ -1840,12 +1857,7 @@ cor(demo_vars, use = "complete.obs") %>%
 
 ### COVID Death Rates by Black Population Share
 
-The correlation table identifies Black population share as the 
-fourth strongest predictor of county COVID death rates. Combined 
-with the finding that persistently high burden counties have nearly 
-three times the national average Black population share (22.9% vs 
-8.4%), a closer examination of how death rates vary across counties 
-grouped by Black population concentration is warranted.
+The correlation table identifies Black population share as the fourth strongest unadjusted correlate of county COVID death rates. Combined with the finding that persistently high burden counties have nearly three times the national average Black population share (22.9% vs 8.4%), a closer examination of how death rates vary across counties grouped by Black population concentration is warranted. Whether that association survives adjustment for structural conditions is the question the regression model takes up in Section 7.
 
 The chart below divides all counties into four equal groups — 
 quartiles — ranked from lowest to highest Black population share. 
@@ -1965,7 +1977,6 @@ p3 <- race_data %>%
 ```
 
 
-
 # 7. Excess Mortality Regression Model
 
 To formally test whether structural factors predicted county COVID 
@@ -1991,10 +2002,15 @@ systematic pattern.
 > of exactly 1.0 means no relationship. The further a value sits 
 > from 1.0 in either direction, the stronger the relationship.
 >
-> For example, an IRR of 3.7 for poverty rate means counties with 
-> the highest poverty rates had approximately 3.7 times the expected 
-> death rate of counties with the lowest poverty rates, after 
-> accounting for every other variable in the model simultaneously.
+> For example, an IRR of 1.182 for educational disadvantage means
+> that a one standard deviation increase in the share of adults
+> without a high school diploma — about 4.1 percentage points — is
+> associated with an 18% higher expected death rate, after accounting
+> for every other variable in the model simultaneously. Because a
+> standard deviation is an abstract unit, the same effect is also
+> reported in plain terms: each additional 10 percentage points of
+> adults without a diploma corresponds to roughly a 51% higher
+> expected death rate.
 >
 > **Statistical significance** is indicated in the Significant 
 > column. Variables marked Yes have relationships strong enough 
@@ -2027,8 +2043,35 @@ nb_model <- glm.nb(
   data = model_data
 )
 
+# --- Standardized predictors: per-SD IRRs, comparable across variables ---
+model_data_std <- model_data %>%
+  mutate(across(c(pct_65_over, pct_black, pct_hispanic, poverty_rate,
+                  pct_no_cars, median_age, pop_per_housing_unit,
+                  pct_less_than_hs),
+                ~ as.numeric(scale(.))))
+
+# Full model, standardized — sensitivity analysis only
+nb_model_std <- glm.nb(
+  total_deceased ~ offset(log(total_pop)) +
+    pct_65_over + pct_black + pct_hispanic + poverty_rate +
+    pct_no_cars + median_age + pop_per_housing_unit + pct_less_than_hs,
+  data = model_data_std
+)
+
+# PRIMARY inferential model — median_age removed (VIF 8.33, sign flip)
+nb_model_v2 <- glm.nb(
+  total_deceased ~ offset(log(total_pop)) +
+    pct_65_over + pct_black + pct_hispanic + poverty_rate +
+    pct_no_cars + pop_per_housing_unit + pct_less_than_hs,
+  data = model_data_std
+)
+
+# Interpretable contrast for the headline claim
+sd_hs <- sd(model_data$pct_less_than_hs)
+irr_10pp <- exp(log(c(estimate = 1.182, lower = 1.159, upper = 1.205)) * (0.10 / sd_hs))
+
 # 1. Extract the coefficients table into a clean data frame
-nb_table_data <- broom::tidy(nb_model, conf.int = TRUE) %>%
+nb_table_data <- broom::tidy(nb_model_v2, conf.int = TRUE) %>%
   mutate(
     # Clean up the variable names for executive reading
     term = case_when(
@@ -2085,86 +2128,76 @@ nb_table_data %>%
 ```
 
 ```{r model_irr_table, message=FALSE, warning=FALSE}
-tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
+tidy(nb_model_v2, conf.int = TRUE, exponentiate = TRUE) %>%
   filter(term != "(Intercept)") %>%
+  arrange(desc(abs(log(estimate)))) %>%
   mutate(across(c(estimate, conf.low, conf.high), ~round(., 3)),
          p.value     = scales::pvalue(p.value),
          significant = if_else(p.value < 0.05, "Yes", "No")) %>%
   rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high) %>%
-  kable(caption = "Negative Binomial Model: Incidence Rate Ratios") %>%
+  kable(caption = "Negative Binomial Model: Incidence Rate Ratios per 1 SD") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
-### What the Model Found
+### What the model found
+>
+> The results complicate the dominant narrative of the pandemic response in
+> several ways.
+>
+> **Educational disadvantage and age structure were the two dominant predictors,
+> and they are comparable in magnitude.** Each additional 10 percentage points of
+> adults without a high school diploma was associated with roughly a 51% higher
+> county death rate (IRR 1.51, 95% CI 1.44–1.58), controlling for age structure,
+> racial composition, poverty, household density, and vehicle access. Elderly
+> population share carried a similar effect (IRR 1.158 per SD, 95% CI 1.132–1.186).
+> A formal test of the difference between the two coefficients was not significant
+> (z = 1.25, p = 0.21), so this analysis does not support ranking one above the
+> other. What it does support is that educational disadvantage belongs alongside
+> age in any account of who died — and the federal response was organized almost
+> entirely around age.
+>
+> Educational attainment at the county level is not primarily a measure of
+> individual health decisions. It reflects decades of school funding, economic
+> opportunity, healthcare access, and community infrastructure. Counties with
+> lower educational attainment had less of everything that protects a population
+> during a health emergency.
+>
+> **Poverty and household density predicted mortality independently.** Poverty
+> rate (IRR 1.099 per SD) and population per housing unit (IRR 1.077 per SD) both
+> remained significant after controlling for education and each other, indicating
+> that they capture distinct dimensions of structural vulnerability rather than
+> restating the same underlying condition.
+>
+> **Vehicle access showed no independent effect.** Households without a vehicle,
+> included as a proxy for healthcare access and mobility constraint, was not a
+> significant predictor (IRR 0.997, p = 0.71). This null result is reported as
+> found; the measure may be too coarse to capture access barriers at county scale.
+>
+> **Hispanic population share was modestly protective.** After controlling for
+> poverty and education, counties with higher Hispanic population shares had
+> slightly lower expected death rates (IRR 0.971 per SD, p < 0.001). The effect is
+> small but consistent in direction with what epidemiologists term the Hispanic
+> Health Paradox. The magnitude here does not support strong claims about the
+> mechanism.
+>
+> **Black population share was not a statistically significant independent
+> predictor.** This is the finding that speaks most directly to structural
+> inequity. After controlling for educational attainment, poverty, and household
+> density — the structural conditions that disproportionately characterize
+> majority Black counties as a result of historical policy — Black population
+> share itself had no significant independent association with county death rates
+> (IRR 0.993, 95% CI 0.978–1.009, p = 0.376). This null held identically across
+> both model specifications tested.
+>
+> The mortality disparity documented throughout this analysis is real and severe.
+> It is not explained by race as a risk factor. It is explained by the structural
+> conditions imposed on these communities over generations, which COVID exposed.
 
-The results challenge the dominant narrative of the pandemic 
-response in important ways.
-
-**Education was the strongest predictor.** Counties where more 
-adults lack a high school diploma had dramatically higher COVID 
-death rates — an IRR of 85.5 — after accounting for age, race, 
-poverty, and every other variable simultaneously. This is not 
-primarily a story about individual health decisions. Educational 
-attainment at the county level reflects decades of investment 
-in schools, economic opportunity, healthcare access, and 
-community infrastructure. Counties with lower educational 
-attainment had less of everything that protects a community 
-during a health emergency.
-
-**Age mattered, but less than education.** The federal COVID 
-response was organized almost entirely around age as the primary 
-risk factor — vaccine priority tiers, hospital protocols, and 
-public messaging all centered on protecting elderly populations. 
-Age was indeed a significant predictor with an IRR of 128. 
-However its confidence interval is extremely wide (51 to 324) 
-reflecting statistical uncertainty, while education's confidence 
-interval is tighter (51 to 143) making it the more precisely 
-estimated predictor of the two.
-
-**Poverty independently predicted death rates.** An IRR of 3.7 
-for poverty rate means high-poverty counties had nearly four 
-times the expected death rate of low-poverty counties after 
-controlling for everything else. Poverty and education are 
-related but the model confirms they represent distinct 
-dimensions of structural vulnerability — both matter 
-independently.
-
-**Hispanic population share was protective.** After controlling 
-for poverty and education, counties with higher Hispanic 
-population shares had lower expected death rates — an IRR of 
-0.73. This is consistent with what epidemiologists call the 
-Hispanic Health Paradox — Hispanic communities in the United 
-States consistently show better health outcomes than their 
-socioeconomic characteristics alone would predict.
-
-**Black population share was not a statistically significant 
-independent predictor.** This is the finding that most directly 
-speaks to structural inequity. After controlling for educational 
-attainment and poverty — the structural conditions that 
-disproportionately characterize majority Black counties due to 
-historical policy choices — Black population share itself had 
-no statistically significant independent effect on death rates 
-(IRR 0.958, p=0.425). The disparity documented throughout this 
-analysis is real and severe. But it is not explained by race 
-as an inherent risk factor. It is explained by the structural 
-conditions that were imposed on these communities over 
-generations and that COVID exposed with devastating clarity.
-
-> **What This Means for Policy:** You cannot address the 
-> mortality disparity documented in this analysis by targeting 
-> race as a category. The data says the intervention points 
-> are educational investment, poverty reduction, and healthcare 
-> infrastructure in structurally disadvantaged communities — 
-> which disproportionately but not exclusively serve majority 
-> Black populations in the Deep South. Targeting the structural 
-> conditions rather than the demographic category is both more 
-> analytically defensible and more likely to produce lasting 
-> change.
 
 ```{r irr_forest_plot, fig.cap="Forest plot of Incidence Rate Ratios", message=FALSE, warning=FALSE}
 library(plotly)
 
-irr_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
+irr_data <- tidy(nb_model_v2, conf.int = TRUE, exponentiate = TRUE) %>%
   filter(term != "(Intercept)") %>%
   mutate(
     term_clean = recode(term,
@@ -2177,13 +2210,17 @@ irr_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
                         pop_per_housing_unit = "Pop. per Housing Unit",
                         pct_less_than_hs     = "% Without HS Diploma"
     ),
-    direction = if_else(estimate > 1, "Risk Factor", "Protective"),
+    direction = case_when(
+  p.value >= 0.05 ~ "Not significant",
+  estimate > 1    ~ "Risk Factor",
+  TRUE            ~ "Protective"
+),
     
     # Plain language interpretation for tooltip
-    plain_language = case_when(
-      term == "pct_less_than_hs" ~ "Counties with the highest share of adults\nwithout a high school diploma have\n1.8x the expected death rate...",
-      TRUE ~ "See hover panel metric values for clear structural risk variance details."
-    ),
+  plain_language = case_when(
+    term == "pct_less_than_hs" ~ "Each +10 percentage points of    adults without\na high school diploma is associated with ~51%\nhigher expected death rate (IRR 1.51, CI 1.44-1.58).",
+  TRUE ~ "Effect shown per 1 standard deviation increase."
+),
     
     # Full tooltip text
     tooltip_text = paste0(
@@ -2208,12 +2245,14 @@ p_forest <- ggplot(irr_data,
                  height = 0.2, 
                  color = "grey40") +
   geom_point(size = 3.5) +
-  scale_color_manual(values = c("Risk Factor" = "#E63946",
-                                "Protective" = "#457B9D"),
-                     name = NULL) +
+  scale_color_manual(values = c("Risk Factor"    = "#E63946",
+                              "Protective"     = "#457B9D",
+                              "Not significant" = "grey60"),
+                   name = NULL) +
+                    
   scale_x_log10() +
   labs(title = "Incidence Rate Ratios: County COVID-19 Death Rate",
-       x = "Incidence Rate Ratio (IRR) — Log Scale", y = NULL) +
+       x = "Incidence Rate Ratio per 1 SD (IRR) — Log Scale", y = NULL) +
   theme_minimal(base_size = 11)
 
 # Convert to interactive plotly
@@ -2225,6 +2264,48 @@ ggplotly(p_forest, tooltip = "text", width = NULL, height = 400) %>%
     legend = list(orientation = "h", x = 0.1, y = -0.2)
   )
 ```
+---
+
+> ### Model specification and robustness
+>
+> An initial specification included both `median_age` and `pct_65_over`. These
+> two measures of age structure were strongly collinear (VIF 8.33 and 7.95
+> respectively) and produced coefficients with opposing signs — `median_age`
+> appeared protective (IRR 0.928) while elderly share appeared harmful
+> (IRR 1.23). Opposing signs on collinear terms indicate variance splitting
+> rather than distinct effects, and neither coefficient is separately
+> interpretable under those conditions.
+>
+> The primary inferential model therefore removes `median_age` and retains
+> `pct_65_over`, the more directly interpretable quantity for mortality analysis.
+> All remaining predictors have VIF below 3.
+>
+> By AIC, the full model retaining both age terms fits better (26489.66 vs
+> 26501.36). This is disclosed rather than resolved: the two age variables
+> jointly capture age structure more completely than either alone, since counties
+> with identical elderly shares can differ in median age depending on their
+> proportion of children and young adults. Because the goal here is inference
+> about the magnitude of structural predictors rather than prediction of county
+> death counts, the specification with interpretable coefficients is used for all
+> reported estimates, and the better-fitting model is reported as a sensitivity
+> analysis.
+>
+> Coefficients for every predictor other than the age terms were stable across
+> both specifications. Educational disadvantage moved from 1.20 to 1.182, poverty
+> from 1.08 to 1.099, household density from 1.07 to 1.077, and Hispanic share
+> from 0.961 to 0.971. The null results for Black population share (p = 0.425 and
+> p = 0.376) and vehicle access (p = 0.717 and p = 0.711) were unchanged. The
+> substantive conclusions of this analysis are not sensitive to the treatment of
+> age structure.
+>
+> **Reporting scale.** All predictors are proportions on a 0–1 scale.
+> Incidence rate ratios are therefore reported per standard deviation, which
+> makes effect magnitudes comparable across predictors measured in different
+> natural units. Unstandardized IRRs on a 0–1 predictor describe the contrast
+> between a hypothetical county at 0% and one at 100% — a range no county in the
+> data approaches — and are not reported here for that reason.
+
+---
 
 # 8. Seasonal Decomposition
 
