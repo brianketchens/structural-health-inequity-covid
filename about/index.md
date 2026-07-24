@@ -12,17 +12,20 @@ US counties from March 2020 through September 2022, with a focus on
 identifying the structural conditions that predicted which communities 
 bore disproportionate and persistent pandemic burden.
 
-The central finding challenges the dominant narrative of the pandemic 
-response: after controlling for age structure, racial composition, 
-poverty, and other covariates, the proportion of adults without a 
-high school diploma was the strongest independent predictor of county 
-COVID death rates (IRR = 85.5, 95% CI: 51.2-143.0, p<0.001). Black 
-population share was not a statistically significant independent 
-predictor (IRR = 0.958, p=0.425) after structural conditions were 
-controlled for — indicating that the severe mortality disparities 
-observed in majority Black communities reflect structural inequity 
-rather than inherent demographic risk.
-
+> The central finding complicates the dominant narrative of the pandemic
+> response: after controlling for age structure, racial composition, poverty,
+> and household density, the proportion of adults without a high school diploma
+> was among the two strongest independent predictors of county COVID death rates,
+> statistically indistinguishable from elderly population share. Each 10
+> percentage point increase in adults without a high school diploma was
+> associated with approximately a 51% higher death rate (IRR 1.51, 95% CI
+> 1.44–1.58).
+>
+> Black population share was not a statistically significant independent
+> predictor (IRR 0.993, p = 0.376) once structural conditions were controlled
+> for — indicating that the severe mortality disparities observed in majority
+> Black communities reflect structural inequity rather than demographic risk.
+> This null result held identically across both model specifications tested.
 ---
 
 ## Key Findings
@@ -103,3 +106,61 @@ source file.
 ---
 
 ## Repository Structure
+
+```text
+structural-health-inequity-covid/
+│
+├── index.html                       # Live interactive report
+├── covid_county_analysis_final.Rmd  # Fully reproducible source
+├── about/
+│   └── index.md                     # Project background and methodology
+├── .gitignore                       # Excludes county_weekly.csv
+└── README.md                        # This file
+```
+
+---
+
+## Phase 2 Roadmap
+
+| Priority | Data Source | Analytical Purpose |
+|----------|-------------|-------------------|
+| 1 | USAFacts + CDC Wonder | Complete national coverage, extend to May 2023 |
+| 2 | CDC PLACES | Clinical comorbidity covariates (diabetes, obesity, COPD) |
+| 3 | CDC Vaccination Data | Partition prior infection vs vaccination protection |
+| 4 | CMS Medicaid/Medicare | Healthcare access as predictor of persistent burden |
+| 5 | HRSA Shortage Areas | Pre-pandemic healthcare desert identification |
+| 6 | Indian Health Service | Native American community analysis (McKinley County NM) |
+
+---
+
+## Tools and Packages
+
+**SQL / ETL:** Google BigQuery Standard SQL
+
+**R Packages:** tidyverse, bigrquery, MASS, lme4, broom, forecast, 
+tsibble, feasts, ggplot2, plotly, leaflet, tigris, sf, ggridges, 
+patchwork, viridis, kableExtra
+
+---
+
+## Author
+
+**Brian E. Ketchens**  
+Data Analytics | Public Health Equity  
+[GitHub](https://github.com/brianketchens)
+
+---
+
+## Citation
+
+If you use or reference this analysis please cite as:
+
+> Ketchens, B.E. (2025). Structural Health Inequity During Pandemics: 
+> A County-Level COVID-19 Mortality Analysis. 
+> https://brianketchens.github.io/structural-health-inequity-covid/
+
+---
+
+*Analysis period: March 2020 – September 2022*  
+*Phase 2 data integration in progress*  
+*Last updated: May 2025*
